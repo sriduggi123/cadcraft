@@ -201,6 +201,9 @@ pub fn write_dxf(d: &Drawing) -> String {
 
 /// Regions, written as closed polylines.
 mod dxf_region;
+/// Session handles renumbered on export (the fork's multiplayer decision D5).
+mod renumber;
+pub use renumber::write_shared;
 
 #[cfg(test)]
 mod tests;

@@ -277,6 +277,29 @@ impl EntityStore {
     pub fn chunk_slices(&self) -> impl Iterator<Item = (usize, &[Arc<Entity>])> + '_ {
         self.chunks.iter().map(|c| (Arc::as_ptr(c) as usize, c.items.as_slice()))
     }
+    /// Handles whose entity was added, removed or replaced since `before` (an earlier clone of this
+    /// store), in no particular order. Chunks both stores still share are skipped, so the cost
+    /// follows the size of the edit, not of the store.
+    pub fn changed_since(&self, before: &EntityStore) -> Vec<Handle> {
+        let shared = |c: &Arc<Chunk>, other: &[Arc<Chunk>]| other.iter().any(|o| Arc::ptr_eq(c, o));
+        let mut out = std::collections::BTreeSet::new();
+        let mut look = |chunks: &[Arc<Chunk>], other: &[Arc<Chunk>]| {
+            for c in chunks.iter().filter(|c| !shared(c, other)) {
+                for e in &c.items {
+                    let same = match (self.get(e.handle), before.get(e.handle)) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        _ => false,
+                    };
+                    if !same {
+                        out.insert(e.handle);
+                    }
+                }
+            }
+        };
+        look(&self.chunks, &before.chunks);
+        look(&before.chunks, &self.chunks);
+        out.into_iter().collect()
+    }
     /// The last entity in draw order (AutoCAD's "Last" selection).
     pub fn last(&self) -> Option<&Arc<Entity>> {
         self.chunks.last().and_then(|c| c.items.last())

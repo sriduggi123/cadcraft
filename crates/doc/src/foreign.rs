@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Handle, RawTag};
 
 /// What a file handle stood for when the object it named is one CADCraft writes itself (under a
@@ -17,7 +19,7 @@ use crate::{Handle, RawTag};
 pub type ForeignKey = (String, String);
 
 /// A non-graphical object of a type or role CADCraft does not model.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForeignObject {
     /// Its handle in the file it came from (kept on save).
     pub handle: Handle,
@@ -28,7 +30,7 @@ pub struct ForeignObject {
 }
 
 /// What an entity, table record or block carries beyond what CADCraft models.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForeignExtra {
     /// Its extension dictionary (one of [`Foreign::objects`]).
     pub xdict: Option<Handle>,
@@ -51,7 +53,7 @@ impl ForeignExtra {
 }
 
 /// Everything of a file CADCraft keeps without modelling it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Foreign {
     /// CLASS records (groups after `0 CLASS`) of the kept objects' and entities' types.
     pub classes: Vec<Vec<RawTag>>,
@@ -60,11 +62,14 @@ pub struct Foreign {
     /// Entries of the named object dictionary that CADCraft doesn't write itself: (key, object).
     pub dictionary: Vec<(String, Handle)>,
     /// Extras of entities, by handle.
+    #[serde(with = "pairs")]
     pub entities: BTreeMap<Handle, ForeignExtra>,
     /// Extras of table records (`("LAYER", "WALLS")`), tables (`("TABLE", "LAYER")`) and blocks
     /// (`("BLOCK", "DOOR")`), by [`ForeignKey`].
+    #[serde(with = "pairs")]
     pub records: BTreeMap<ForeignKey, ForeignExtra>,
     /// The roles of the file handles the kept data refers to, for objects CADCraft rewrites.
+    #[serde(with = "pairs")]
     pub targets: BTreeMap<Handle, ForeignKey>,
     /// The upper-case names of the file's classes in its CLASSES order, kept when the file has
     /// proxy objects or entities: a proxy's class number (group 91) is 500 plus its class's place
@@ -92,5 +97,21 @@ impl Foreign {
     /// The entities the data store has records for (their 320 handles).
     pub fn data_store_entities(&self) -> std::collections::BTreeSet<Handle> {
         self.data_store.iter().filter(|t| t.code == 320).filter_map(|t| Handle::parse_hex(t.value.trim())).collect()
+    }
+}
+
+/// Maps whose keys aren't strings (handles, `(kind, name)` pairs) as lists of pairs, so formats
+/// that only allow string keys (JSON) can hold them.
+mod pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(m: &BTreeMap<K, V>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(m.iter())
+    }
+
+    pub fn deserialize<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<K, V>, D::Error> {
+        Vec::<(K, V)>::deserialize(d).map(|v| v.into_iter().collect())
     }
 }

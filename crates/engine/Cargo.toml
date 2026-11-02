@@ -28,5 +28,8 @@ rstar = { version = "0.13", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+# The fork's collaboration diffs, tested on real commands (collab is a lower layer).
+cadcraft-collab = { workspace = true }
+postcard = { workspace = true }
 # Real DXF files for the external reference tests (io is a lower layer).
 cadcraft-io = { workspace = true }

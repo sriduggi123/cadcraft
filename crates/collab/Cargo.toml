@@ -1,0 +1,16 @@
+[package]
+name = "cadcraft-collab"
+description = "CADCraft real-time collaboration core: drawing diffs and their application, client handle spaces, per-person drawing variables and server snapshots (no networking)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cadcraft-doc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
