@@ -12,15 +12,23 @@
 //! - [`space`] gives each client its own range of handles, so two people never make the same one.
 //! - [`snapshot`] encodes a whole drawing for the server: a postcard envelope with the drawing as
 //!   JSON inside it, so a snapshot keeps loading after entity types gain fields.
+//! - [`server::Server`] orders batches, refuses a batch that doesn't apply whole and sends the
+//!   rest to everyone; [`client::Client`] shows its own edits at once and rebuilds its view when
+//!   someone else's batch arrives. Both are pure state machines; a [`Link`] carries the
+//!   [`message`]s.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
 mod apply;
 mod change;
+pub mod client;
 mod container;
 mod diff;
 mod docfields;
 mod json;
+pub mod link;
+pub mod message;
+pub mod server;
 pub mod snapshot;
 pub mod space;
 pub mod vars;
@@ -31,6 +39,7 @@ pub use change::Change;
 pub use container::Container;
 pub use diff::diff;
 pub use json::Json;
+pub use link::Link;
 
 /// What can go wrong syncing.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]

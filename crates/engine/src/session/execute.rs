@@ -30,7 +30,11 @@ impl Session {
         if let Some(why) = cmd::blocks::bedit::refused_in_editor(self, spec.id) {
             return Err(EngineError::Disabled(spec.id.into(), why));
         }
+        if let Some(why) = self.collab_refuses(spec.id) {
+            return Err(EngineError::Disabled(spec.id.into(), why));
+        }
         let before = self.state().ok().map(|s| (s.doc.clone(), s.selection.clone(), s.uid));
+        let shared_before = before.as_ref().map(|(d, _, uid)| (d.clone(), *uid));
         let editing = self.state().is_ok_and(|s| s.block_edit.is_some());
         let run = spec.run;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self, params)));
@@ -85,6 +89,9 @@ impl Session {
         if let Some(snap) = in_routine {
             self.lisp_record_step(snap);
         }
+        if let Some((doc, uid)) = shared_before {
+            self.collab_after_edit(&doc, uid, spec.id);
+        }
         result
     }
 
@@ -100,6 +107,9 @@ impl Session {
     /// Take the last step back. Inside a LISP routine, the routine's last command first; past
     /// those, the drawing's step before the routine, which then starts from there.
     pub fn undo(&mut self) -> Result<Option<String>> {
+        if let Some(why) = self.collab_refuses("undo") {
+            return Err(EngineError::Disabled("undo".into(), why));
+        }
         if let Some(label) = self.lisp_take_back(false) {
             return Ok(Some(label));
         }
@@ -114,6 +124,9 @@ impl Session {
 
     /// Bring back what the last undo took back; inside a LISP routine, what U inside it took first.
     pub fn redo(&mut self) -> Result<Option<String>> {
+        if let Some(why) = self.collab_refuses("redo") {
+            return Err(EngineError::Disabled("redo".into(), why));
+        }
         if let Some(label) = self.lisp_take_back(true) {
             return Ok(Some(label));
         }

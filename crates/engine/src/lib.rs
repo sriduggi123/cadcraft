@@ -17,6 +17,8 @@ pub mod blockedit;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capped_read;
 pub mod cmd;
+/// Shared sessions (the fork's multiplayer work).
+pub mod collab;
 pub mod doc_path;
 mod finite;
 pub mod grip_dims;
@@ -146,6 +148,8 @@ pub struct Session {
     /// ([`Session::input_object`]): a pick at exactly that point picks that object
     /// ([`Session::pick_object`]).
     pick_hint: Option<(Handle, Vec2)>,
+    /// The shared session of one open drawing ([`collab`]).
+    collab: Option<collab::Live>,
 }
 
 impl Default for Session {
@@ -197,6 +201,7 @@ impl Session {
             lisp_last: None,
             hatch_picks: None,
             pick_hint: None,
+            collab: None,
         }
     }
 

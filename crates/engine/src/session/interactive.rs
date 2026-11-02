@@ -37,6 +37,9 @@ impl Session {
             }
             return Err(EngineError::UnknownCommand(name.to_string()));
         };
+        if let Some(why) = self.collab_refuses(spec.id) {
+            return Err(EngineError::Disabled(spec.id.into(), why));
+        }
         if transparent && spec.transparent && self.running.is_some() {
             // Transparent commands (zoom, pan…) run without cancelling the active one.
             if spec.interactive.is_none() {
@@ -346,12 +349,15 @@ impl Session {
     /// the drawing as it was before the command, as a panic in its `input` does.
     fn finish(&mut self, run: Running, cancelled: bool) {
         let (id, before, selection) = (run.id.clone(), run.before.clone(), run.selection_before.clone());
+        let uid = self.state().ok().map(|st| st.uid);
         if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish_guarded(run, cancelled))) {
             if let Ok(st) = self.state_mut() {
                 st.doc = before;
                 st.selection = selection;
             }
             self.echo(format!("Internal error in {id}: {}", crate::guard::message(&*p)));
+        } else if let Some(uid) = uid {
+            self.collab_after_edit(&before, uid, &id);
         }
     }
 

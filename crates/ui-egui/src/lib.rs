@@ -685,6 +685,11 @@ impl CadApp {
         // A long AutoLISP routine runs one bounded slice per frame, including hidden web/native
         // ticks; it must not depend on a paint or `RequestPaintWhileHidden`.
         self.session.lisp_tick();
+        // A shared session's incoming edits, between commands; poll while one is live.
+        self.session.collab_tick();
+        if self.session.collab_live() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // Time-based and idempotent by its own deadline; keeps autosave alive while hidden.
         self.autosave_tick(ctx);
         #[cfg(not(target_arch = "wasm32"))]

@@ -18,6 +18,14 @@ pub fn apply(d: &mut Drawing, changes: &[Change]) -> Result<()> {
     Ok(())
 }
 
+/// Apply what still applies of `changes`, skipping a change that fails (each change is applied
+/// whole or not at all). The client uses it to show its pending edits on top of others' edits.
+pub(crate) fn apply_lenient(d: &mut Drawing, changes: &[Change]) {
+    for c in changes {
+        let _ = apply_one(d, c);
+    }
+}
+
 fn apply_one(d: &mut Drawing, c: &Change) -> Result<()> {
     match c {
         Change::Delete { id } => delete(d, *id),
@@ -86,20 +94,21 @@ fn common(d: &mut Drawing, id: Handle, prop: &str, value: Option<&Json>) -> Resu
     modify(d, id, |e| e.common = common)
 }
 
-/// Put a collection in the given draw order; it must list exactly the collection's entities.
+/// Put a collection in the given draw order. Listed objects that are gone (someone deleted them)
+/// are skipped, and objects the list doesn't name (someone added them meanwhile) stay on top in
+/// their order, so a concurrent edit never makes a draw order fail.
 fn order(d: &mut Drawing, container: &Container, ids: &[Handle]) -> Result<()> {
     let s = store_mut(d, container).ok_or_else(|| Error::Invalid(format!("no collection {container:?}")))?;
-    if ids.len() != s.len() {
-        return Err(Error::Invalid(format!("draw order lists {} of {} objects", ids.len(), s.len())));
-    }
     let mut out = EntityStore::new();
     for h in ids {
-        let e = s.get(*h).ok_or(Error::Unknown(*h))?;
-        if out.contains(*h) {
-            return Err(Error::Invalid(format!("draw order lists {h:?} twice")));
+        if let Some(e) = s.get(*h)
+            && !out.contains(*h)
+        {
+            out.push((**e).clone());
         }
-        out.push((**e).clone());
     }
+    let rest: Vec<Entity> = s.iter().filter(|e| !out.contains(e.handle)).map(|e| (**e).clone()).collect();
+    rest.into_iter().for_each(|e| out.push(e));
     *s = out;
     Ok(())
 }

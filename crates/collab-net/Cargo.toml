@@ -1,0 +1,15 @@
+[package]
+name = "cadcraft-collab-net"
+description = "CADCraft collaboration transport: the client link to a session server over WebSockets (ws:// and wss://)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cadcraft-collab = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
