@@ -7,7 +7,7 @@ mod array;
 mod audit;
 pub(crate) mod blocks;
 pub mod clipboard;
-mod collab;
+pub mod collab;
 pub mod constraints;
 mod draw;
 mod draw2;

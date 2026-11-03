@@ -98,6 +98,8 @@ impl Client {
             }
             ServerMsg::Error { message } => Err(Error::Invalid(message)),
             ServerMsg::Welcome { .. } => Err(Error::Invalid("a second welcome".into())),
+            // Only the file list sends it; a session never does.
+            ServerMsg::Files { .. } => Ok(Received::default()),
         }
     }
 

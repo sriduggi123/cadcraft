@@ -40,6 +40,7 @@ pub mod switch;
 // The External References palette.
 pub mod xrefs;
 
+pub mod cloud;
 pub mod dyngrips;
 pub mod dyninput;
 pub mod gpu;
@@ -314,6 +315,8 @@ pub struct CadApp {
     /// The startup update check and its prompt (desktop; [`updates_ui`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub updates_rt: updates_ui::Runtime,
+    /// The Cloud Files dialog ([`cloud`]).
+    pub cloud: cloud::State,
 }
 
 impl CadApp {
@@ -369,6 +372,7 @@ impl CadApp {
             bedit: bedit::State::default(),
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
+            cloud: cloud::State::default(),
         }
     }
 
@@ -479,12 +483,24 @@ impl CadApp {
         if let Some(dir) = &self.ui.last_lisp_dir {
             prefs["lispDir"] = json!(dir);
         }
+        if !self.cloud.server.is_empty() {
+            prefs["cloudServer"] = json!(self.cloud.server);
+        }
+        if !self.cloud.user.is_empty() {
+            prefs["cloudUser"] = json!(self.cloud.user);
+        }
         prefs.to_string()
     }
 
     /// Restore preferences saved by [`Self::prefs_json`]; unknown or malformed values are ignored.
     pub fn load_prefs(&mut self, json: &str) {
         let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+        if let Some(server) = v.get("cloudServer").and_then(Value::as_str) {
+            self.cloud.server = server.to_string();
+        }
+        if let Some(user) = v.get("cloudUser").and_then(Value::as_str) {
+            self.cloud.user = user.to_string();
+        }
         if let Some(calculator) = v.get("quickcalc") {
             self.quickcalc.load_prefs(calculator);
         }
@@ -903,6 +919,7 @@ impl CadApp {
         #[cfg(not(target_arch = "wasm32"))]
         updates_ui::show(self, ui.ctx());
         dialogs::show(self, ui.ctx());
+        cloud::show(self, ui.ctx());
         palettes::patterns::prompt_picker(self, ui.ctx());
         closing::prompt(self, ui.ctx());
         save_loss::prompt(self, ui.ctx());

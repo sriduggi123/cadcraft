@@ -14,9 +14,23 @@ pub const MAX_MESSAGE_BYTES: usize = crate::snapshot::MAX_BYTES + (1 << 20);
 pub enum ClientMsg {
     /// The first message: who is joining, and, from the person who starts the session, the
     /// drawing to start it with (a [`crate::snapshot`]); ignored once the session has one.
-    Hello { name: String, seed: Option<Vec<u8>> },
+    /// `create`: this must be a new file; the server refuses if the name is taken.
+    Hello { name: String, seed: Option<Vec<u8>>, create: bool },
     /// One command's changes. `batch` numbers the client's batches, so replies can name them.
     Batch { batch: u64, changes: Vec<Change> },
+    /// On the server's file list (`/files`): ask for the list.
+    List,
+}
+
+/// A file in the cloud: a saved or live session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInfo {
+    pub name: String,
+    /// Last change, in seconds since 1970.
+    pub modified: u64,
+    /// Who has it open now.
+    pub people: Vec<String>,
 }
 
 /// Someone in the session.
@@ -41,6 +55,8 @@ pub enum ServerMsg {
     Peers { peers: Vec<Peer> },
     /// The server can't go on with this client (it closes the link after this).
     Error { message: String },
+    /// The reply to `List`, newest first.
+    Files { files: Vec<FileInfo> },
 }
 
 /// Encode a message for the wire.

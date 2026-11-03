@@ -32,6 +32,8 @@ pub struct Live {
     client: Option<Client>,
     /// Why the session ended, when it did.
     ended: Option<String>,
+    /// The session's address (`ws://host/s/<name>`), when known.
+    url: String,
 }
 
 impl Session {
@@ -39,6 +41,11 @@ impl Session {
     /// drawing (ignored if the session already has one). The welcome arrives through
     /// [`Session::collab_tick`].
     pub fn collab_attach(&mut self, link: Box<dyn Link>, name: &str, host: bool) -> Result<()> {
+        self.collab_attach_to(link, "", name, host, false)
+    }
+
+    /// [`Session::collab_attach`] to the session at `url`; `create`: it must be a new file.
+    pub fn collab_attach_to(&mut self, link: Box<dyn Link>, url: &str, name: &str, host: bool, create: bool) -> Result<()> {
         if self.collab.as_ref().is_some_and(|l| l.ended.is_none()) {
             return Err(EngineError::Other("already in a shared session (collab.leave first)".into()));
         }
@@ -46,9 +53,19 @@ impl Session {
         let seed = if host { Some(snapshot::encode(&st.doc).map_err(|e| EngineError::Other(e.to_string()))?) } else { None };
         let uid = st.uid;
         let mut link = link;
-        link.send(&ClientMsg::Hello { name: name.to_string(), seed }).map_err(|e| EngineError::Other(e.to_string()))?;
-        self.collab = Some(Live { link, uid, client: None, ended: None });
+        link.send(&ClientMsg::Hello { name: name.to_string(), seed, create }).map_err(|e| EngineError::Other(e.to_string()))?;
+        self.collab = Some(Live { link, uid, client: None, ended: None, url: url.to_string() });
         Ok(())
+    }
+
+    /// The address of the session attached, if one is.
+    pub fn collab_url(&self) -> Option<&str> {
+        self.collab.as_ref().filter(|l| l.ended.is_none()).map(|l| l.url.as_str()).filter(|u| !u.is_empty())
+    }
+
+    /// The drawing (its uid) the session shares.
+    pub fn collab_uid(&self) -> Option<u64> {
+        self.collab.as_ref().filter(|l| l.ended.is_none()).map(|l| l.uid)
     }
 
     /// Whether a session is attached and hasn't ended.

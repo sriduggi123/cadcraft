@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use cadcraft_collab::message::{self, ClientMsg, MAX_MESSAGE_BYTES, ServerMsg};
+use cadcraft_collab::message::{self, ClientMsg, FileInfo, MAX_MESSAGE_BYTES, ServerMsg};
 use cadcraft_collab::server::{Outgoing, Server, To};
 use cadcraft_collab::snapshot;
 use cadcraft_doc::Drawing;
@@ -72,6 +72,36 @@ impl Rooms {
         (rooms.len(), rooms.values().map(|r| r.conns.len()).sum())
     }
 
+    /// The cloud files: the sessions saved in the data folder and the live ones, newest first,
+    /// with who has each open.
+    pub fn files(&self) -> Vec<FileInfo> {
+        let mut files: HashMap<String, FileInfo> = HashMap::new();
+        if let Some(entries) = self.config.data.as_ref().and_then(|d| std::fs::read_dir(d).ok()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(stem) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".cadsession")) else { continue };
+                let Some(name) = session_name(&format!("/s/{stem}")) else { continue };
+                let modified = entry.metadata().and_then(|m| m.modified()).map(seconds).unwrap_or(0);
+                files.insert(name.clone(), FileInfo { name, modified, people: Vec::new() });
+            }
+        }
+        for (name, room) in self.lock().iter() {
+            let f = files.entry(name.clone()).or_insert_with(|| FileInfo { name: name.clone(), modified: 0, people: Vec::new() });
+            f.people = room.server.peers().into_iter().map(|p| p.name).collect();
+            if room.saved != Some(room.server.seq()) {
+                f.modified = seconds(std::time::SystemTime::now());
+            }
+        }
+        let mut files: Vec<FileInfo> = files.into_values().collect();
+        files.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+        files
+    }
+
+    /// Whether a cloud file `name` exists, live or saved.
+    fn exists(&self, name: &str) -> bool {
+        self.lock().contains_key(name) || self.file(name).is_some_and(|p| p.exists())
+    }
+
     /// The session's file in the data folder.
     fn file(&self, name: &str) -> Option<PathBuf> {
         self.config.data.as_ref().map(|d| d.join(format!("{name}.cadsession")))
@@ -122,6 +152,10 @@ impl Rooms {
         }
         result.is_ok()
     }
+}
+
+fn seconds(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -207,7 +241,8 @@ fn connection(mut stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
     }
     let mut name = None;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES)).max_frame_size(Some(MAX_MESSAGE_BYTES));
-    let callback = |req: &Request, resp: Response| match session_name(req.uri().path()) {
+    // `/files` is the file list (named "" here: no session has that name).
+    let callback = |req: &Request, resp: Response| match session_name(req.uri().path()).or_else(|| (req.uri().path() == "/files").then(String::new)) {
         Some(n) => {
             name = Some(n);
             Ok(resp)
@@ -252,7 +287,17 @@ fn pump(ws: &mut WebSocket<Replay>, rx: &Receiver<Vec<u8>>, mut on: impl FnMut(C
             }
         }
         match ws.read() {
-            Ok(Message::Binary(b)) => on(message::decode(&b).map_err(|e| e.to_string())?)?,
+            Ok(Message::Binary(b)) => {
+                if let Err(e) = message::decode(&b).map_err(|e| e.to_string()).and_then(&mut on) {
+                    // Send what was queued (the refusal's reason) before closing.
+                    while let Ok(bytes) = rx.try_recv() {
+                        let _ = ws.send(Message::Binary(bytes.into()));
+                    }
+                    let _ = ws.close(None);
+                    let _ = ws.flush();
+                    return Err(e);
+                }
+            }
             Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
@@ -266,7 +311,15 @@ fn pump(ws: &mut WebSocket<Replay>, rx: &Receiver<Vec<u8>>, mut on: impl FnMut(C
 
 fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u8>>, msg: ClientMsg) -> Result<(), String> {
     match (msg, *client) {
-        (ClientMsg::Hello { name: who, seed }, None) => {
+        (ClientMsg::List, None) if name.is_empty() => {
+            if let Ok(bytes) = message::encode(&ServerMsg::Files { files: rooms.files() }) {
+                let _ = tx.send(bytes);
+            }
+            Ok(())
+        }
+        (ClientMsg::Hello { .. }, None) if name.is_empty() => refuse(tx, "join a file at /s/<name>"),
+        (ClientMsg::Hello { create: true, .. }, None) if rooms.exists(name) => refuse(tx, &format!("a cloud file named {name} already exists")),
+        (ClientMsg::Hello { name: who, seed, .. }, None) => {
             // Read a saved session before taking the lock; it is used only if the room is new.
             let saved = if rooms.lock().contains_key(name) {
                 None

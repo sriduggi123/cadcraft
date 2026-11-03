@@ -71,7 +71,7 @@ impl Net {
     fn deliver(&mut self, i: usize) -> bool {
         let Some(msg) = self.members[i].wire.lock().unwrap().up.pop_front() else { return false };
         match msg {
-            ClientMsg::Hello { name, seed } => {
+            ClientMsg::Hello { name, seed, .. } => {
                 let (id, out) = self.server.join(&name, seed.as_deref()).unwrap();
                 self.members[i].id = Some(id);
                 self.route(out);
@@ -81,6 +81,7 @@ impl Net {
                 let out = self.server.batch(id, batch, changes);
                 self.route(out);
             }
+            ClientMsg::List => {}
         }
         true
     }

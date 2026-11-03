@@ -147,3 +147,50 @@ fn a_session_link_serves_the_web_app() {
     assert!(get(addr, "/s/missing.js").0.contains("404"));
     let _ = std::fs::remove_dir_all(&web);
 }
+
+/// Cloud files: save a drawing to the cloud, see it in the list with who has it open, open it
+/// from another app, and a second save under the same name is refused.
+#[test]
+fn cloud_files_are_saved_listed_and_opened() {
+    let data = temp_dir("cloud");
+    let addr = start_with(cadcraft_server::Config { web: None, data: Some(data.clone()) });
+    let server = format!("http://{addr}");
+
+    let mut a = Session::new();
+    a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    let saved = a.execute("cloud.save", &json!({"name": "plan", "server": server, "user": "Asha"})).unwrap();
+    assert_eq!(saved["joined"], true, "{saved}");
+    assert_eq!(a.state().unwrap().title, "plan");
+
+    let list = a.execute("cloud.list", &json!({"server": server})).unwrap();
+    assert_eq!(list["files"][0]["name"], "plan", "{list}");
+    assert_eq!(list["files"][0]["people"], json!(["Asha"]), "{list}");
+
+    let mut b = Session::new();
+    let tabs = b.docs.len();
+    b.execute("cloud.open", &json!({"name": "plan", "server": server, "user": "Bo"})).unwrap();
+    assert_eq!(b.docs.len(), tabs + 1, "opens in a new tab");
+    assert_eq!(b.state().unwrap().title, "plan");
+    assert_eq!(model_len(&b), 1);
+    b.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    wait(&mut a, "Bo's line at Asha", |s| model_len(s) == 2);
+
+    let mut c = Session::new();
+    let err = c.execute("cloud.save", &json!({"name": "plan", "server": server, "user": "Cy"})).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+
+    let (status, page) = get(addr, "/");
+    assert!(status.contains("200"));
+    let page = String::from_utf8_lossy(&page);
+    assert!(page.contains("plan") && page.contains("2 editing"), "{page}");
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
+fn cloud_server_addresses_are_normalised() {
+    use cadcraft_engine::cmd::collab::cloud_server;
+    assert_eq!(cloud_server(&json!({"server": "https://cad.example.com/"})), "wss://cad.example.com");
+    assert_eq!(cloud_server(&json!({"server": "http://10.0.0.2:9010"})), "ws://10.0.0.2:9010");
+    assert_eq!(cloud_server(&json!({"server": "cad.example.com:9010"})), "ws://cad.example.com:9010");
+    assert_eq!(cloud_server(&json!({"server": "wss://x"})), "wss://x");
+}

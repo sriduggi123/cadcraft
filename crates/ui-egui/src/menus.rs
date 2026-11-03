@@ -24,6 +24,10 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.dock.reset", "Reset Panel Layout", &["Window", "Reset Panel Layout"], None),
     ("ui.open", "Open...", &[], Some("Cmd+O")),
     ("ui.newtemplate", "New from Template...", &["File", "New from Template..."], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    ("ui.cloud", "Open from Cloud...", &["File", "Open from Cloud..."], None),
+    #[cfg(not(target_arch = "wasm32"))]
+    ("ui.cloud.save", "Save to Cloud...", &["File", "Save to Cloud..."], None),
     ("ui.saveas", "Save As...", &[], None),
     ("ui.sample", "Open Sample Drawing", &["Help", "Open Sample Drawing"], None),
     ("ui.toggle.toolsets", "Tool Sets", &["Window", "Tool Sets"], Some("Cmd+3")),
@@ -90,6 +94,9 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value) -> Option<Resu
 fn route_ui_subsystems(app: &mut CadApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
     if let Some(result) = crate::spacemouse::route(app, id, params) {
         return Some(result);
+    }
+    if let Some(r) = crate::cloud::route(app, id, params) {
+        return Some(r);
     }
     if let Some(r) = crate::xrefs::route(app, id, params) {
         return Some(r);
