@@ -3,11 +3,11 @@
 //! else's batch arrives, the view is rebuilt as the confirmed drawing with the pending batches
 //! replayed on top, so a pending edit never flickers away.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use cadcraft_doc::Drawing;
 
-use crate::message::{ClientMsg, Peer, ServerMsg};
+use crate::message::{ClientMsg, Peer, Presence, ServerMsg};
 use crate::{Change, Error, Result, apply, diff, snapshot, space, vars};
 
 #[derive(Debug)]
@@ -18,6 +18,8 @@ pub struct Client {
     pending: VecDeque<(u64, Vec<Change>)>,
     next_batch: u64,
     peers: Vec<Peer>,
+    /// The others' presence, by client.
+    others: BTreeMap<u32, Presence>,
     notices: Vec<String>,
 }
 
@@ -35,7 +37,16 @@ impl Client {
         let confirmed = snapshot::decode(bytes)?;
         let mut view = confirmed.clone();
         space::enter(&mut view, client);
-        let c = Client { id: client, seq, confirmed, pending: VecDeque::new(), next_batch: 1, peers: Vec::new(), notices: Vec::new() };
+        let c = Client {
+            id: client,
+            seq,
+            confirmed,
+            pending: VecDeque::new(),
+            next_batch: 1,
+            peers: Vec::new(),
+            others: BTreeMap::new(),
+            notices: Vec::new(),
+        };
         Ok((c, view))
     }
 
@@ -50,6 +61,11 @@ impl Client {
 
     pub fn peers(&self) -> &[Peer] {
         &self.peers
+    }
+
+    /// Where the others are and what they're doing, by client.
+    pub fn others(&self) -> &BTreeMap<u32, Presence> {
+        &self.others
     }
 
     pub fn pending(&self) -> usize {
@@ -93,7 +109,14 @@ impl Client {
                 Ok(Received { view: Some(self.rebuild(view)) })
             }
             ServerMsg::Peers { peers } => {
+                self.others.retain(|c, _| peers.iter().any(|p| p.client == *c));
                 self.peers = peers;
+                Ok(Received::default())
+            }
+            ServerMsg::Presence { client, presence } => {
+                if client != self.id && self.peers.iter().any(|p| p.client == client) {
+                    self.others.insert(client, presence);
+                }
                 Ok(Received::default())
             }
             ServerMsg::Error { message } => Err(Error::Invalid(message)),

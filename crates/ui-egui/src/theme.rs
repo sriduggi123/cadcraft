@@ -97,6 +97,8 @@ pub struct Tokens {
     /// COMPARE: objects only in this drawing, only in the other one, and the areas of change.
     pub compare_this: Color32,
     pub compare_other: Color32,
+    /// Other people in a shared session: cursor, name tag and selection, one colour each.
+    pub presence: [Color32; 6],
     pub compare_area: Color32,
     pub window_stroke: Color32,
     pub crossing_stroke: Color32,
@@ -155,6 +157,14 @@ impl Tokens {
         snap: Color32::from_rgb(0x2f, 0xd0, 0x62),
         compare_this: Color32::from_rgb(0x4c, 0xd9, 0x7b),
         compare_other: Color32::from_rgb(0xff, 0x5c, 0x5c),
+        presence: [
+            Color32::from_rgb(0xe8, 0x59, 0x0c),
+            Color32::from_rgb(0xd6, 0x33, 0x6c),
+            Color32::from_rgb(0x70, 0x48, 0xe8),
+            Color32::from_rgb(0x0c, 0xa6, 0x78),
+            Color32::from_rgb(0x1c, 0x7e, 0xd6),
+            Color32::from_rgb(0xf5, 0x9f, 0x00),
+        ],
         compare_area: Color32::from_rgb(0xff, 0xb4, 0x3c),
         window_stroke: Color32::from_rgb(0x6f, 0xa8, 0xff),
         crossing_stroke: Color32::from_rgb(0x7f, 0xe0, 0x7f),

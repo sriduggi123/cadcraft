@@ -10,15 +10,21 @@
 
 use std::sync::Arc;
 
+pub use cadcraft_collab::Link;
 use cadcraft_collab::client::Client;
-use cadcraft_collab::message::{ClientMsg, Peer, ServerMsg};
-use cadcraft_collab::{Link, snapshot};
-use cadcraft_doc::Drawing;
+use cadcraft_collab::message::{ClientMsg, MAX_SELECTION, Peer, Presence, ServerMsg};
+use cadcraft_collab::snapshot;
+use cadcraft_doc::{Drawing, Space};
+use cadcraft_geom::Vec2;
 
+use crate::view::View;
 use crate::{EngineError, Result, Session};
 
 /// Most messages applied in one tick, so a burst doesn't stall a frame.
 const MAX_PER_TICK: usize = 256;
+
+/// Least time between two presence messages, in seconds (20 a second at most).
+const PRESENCE_EVERY: f64 = 0.05;
 
 /// Commands that can't run in a shared session yet.
 const REFUSED: &[&str] = &["bedit", "refedit", "undo", "u", "redo", "mredo", "oops"];
@@ -34,6 +40,12 @@ pub struct Live {
     ended: Option<String>,
     /// The session's address (`ws://host/s/<name>`), when known.
     url: String,
+    /// The presence last sent, and when (the caller's clock, in seconds).
+    sent: Option<Presence>,
+    sent_at: f64,
+    /// The person whose view this one follows, and the view last copied from them.
+    following: Option<u32>,
+    followed: Option<View>,
 }
 
 impl Session {
@@ -54,7 +66,8 @@ impl Session {
         let uid = st.uid;
         let mut link = link;
         link.send(&ClientMsg::Hello { name: name.to_string(), seed, create }).map_err(|e| EngineError::Other(e.to_string()))?;
-        self.collab = Some(Live { link, uid, client: None, ended: None, url: url.to_string() });
+        self.collab =
+            Some(Live { link, uid, client: None, ended: None, url: url.to_string(), sent: None, sent_at: 0.0, following: None, followed: None });
         Ok(())
     }
 
@@ -105,6 +118,11 @@ impl Session {
         if self.running.is_some() || self.lisp_busy() {
             return;
         }
+        self.collab_drain();
+        self.collab_follow_step();
+    }
+
+    fn collab_drain(&mut self) {
         for _ in 0..MAX_PER_TICK {
             let Some(live) = self.collab.as_mut().filter(|l| l.ended.is_none()) else { return };
             let msg = match live.link.recv() {
@@ -116,6 +134,83 @@ impl Session {
             if let Err(e) = self.collab_receive(msg) {
                 return self.collab_end(e);
             }
+        }
+    }
+
+    /// Send where this person is: `cursor` in drawing coordinates while it is over the drawing,
+    /// `now` the caller's clock in seconds. The selection, the command running and the view come
+    /// from the session. Sent only when it changed, 20 times a second at most. The UI calls it
+    /// every frame.
+    pub fn collab_presence(&mut self, cursor: Option<Vec2>, now: f64) {
+        let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none()) else { return };
+        let uid = live.uid;
+        let mut p = Presence::default();
+        if let Some(st) = self.docs.get(self.active).filter(|d| d.uid == uid) {
+            p.layout = layout_name(&st.space);
+            p.cursor = cursor.filter(|c| c.is_finite()).map(|c| [c.x, c.y]);
+            p.selection = st.selection.iter().take(MAX_SELECTION).copied().collect();
+            p.command = self.running.as_ref().map(|r| r.id.to_ascii_uppercase());
+            let v = st.view();
+            p.view = Some([v.center.x, v.center.y, v.height]);
+        }
+        let Some(live) = self.collab.as_mut() else { return };
+        let due = now - live.sent_at >= PRESENCE_EVERY || now < live.sent_at;
+        if live.sent.as_ref() == Some(&p) || !due {
+            return;
+        }
+        live.sent_at = now;
+        let sent = live.link.send(&ClientMsg::Presence(p.clone()));
+        live.sent = Some(p);
+        if let Err(e) = sent {
+            self.collab_end(format!("the connection to the server failed: {e}"));
+        }
+    }
+
+    /// The others in the session with where they are, by client id.
+    pub fn collab_others(&self) -> Vec<(Peer, Presence)> {
+        let Some(c) = self.collab.as_ref().filter(|l| l.ended.is_none()).and_then(|l| l.client.as_ref()) else { return Vec::new() };
+        c.peers().iter().filter(|p| p.client != c.id()).map(|p| (p.clone(), c.others().get(&p.client).cloned().unwrap_or_default())).collect()
+    }
+
+    /// Follow `client`'s view (None: stop).
+    pub fn collab_follow(&mut self, client: Option<u32>) {
+        if let Some(l) = self.collab.as_mut() {
+            l.following = client;
+            l.followed = None;
+        }
+        self.collab_follow_step();
+    }
+
+    /// The person this one follows.
+    pub fn collab_following(&self) -> Option<u32> {
+        self.collab.as_ref().filter(|l| l.ended.is_none()).and_then(|l| l.following)
+    }
+
+    /// Copy the followed person's view; stop when they leave or this person pans or zooms.
+    fn collab_follow_step(&mut self) {
+        let Some(live) = self.collab.as_ref().filter(|l| l.ended.is_none()) else { return };
+        let (Some(who), Some(client)) = (live.following, live.client.as_ref()) else { return };
+        let name = client.peers().iter().find(|p| p.client == who).map(|p| p.name.clone());
+        let lead = client.others().get(&who).cloned();
+        let (uid, followed) = (live.uid, live.followed);
+        let Some(name) = name else {
+            self.collab_follow(None);
+            return self.echo("Stopped following: they left the session.");
+        };
+        let Some(st) = self.docs.get_mut(self.active).filter(|d| d.uid == uid) else { return };
+        if followed.is_some_and(|v| !same_view(&v, &st.view())) {
+            self.collab_follow(None);
+            return self.echo(format!("Stopped following {name}."));
+        }
+        let Some(lead) = lead.filter(|p| p.layout == layout_name(&st.space)) else { return };
+        let Some([x, y, h]) = lead.view else { return };
+        let v = View { center: Vec2::new(x, y), height: h };
+        if !same_view(&v, &st.view()) {
+            st.set_view_quiet(v);
+        }
+        let now = st.view();
+        if let Some(l) = self.collab.as_mut() {
+            l.followed = Some(now);
         }
     }
 
@@ -176,4 +271,17 @@ impl Session {
             self.collab_end(format!("{id}'s changes could not be sent: {e}"));
         }
     }
+}
+
+/// The presence name of a space: "" for model space, else the layout's name.
+fn layout_name(space: &Space) -> String {
+    match space {
+        Space::Model => String::new(),
+        Space::Paper(name) => name.clone(),
+    }
+}
+
+fn same_view(a: &View, b: &View) -> bool {
+    let tol = 1e-9 * a.height.abs().max(b.height.abs()).max(1.0);
+    (a.center.x - b.center.x).abs() <= tol && (a.center.y - b.center.y).abs() <= tol && (a.height - b.height).abs() <= tol
 }

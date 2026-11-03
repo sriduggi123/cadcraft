@@ -194,3 +194,44 @@ fn cloud_server_addresses_are_normalised() {
     assert_eq!(cloud_server(&json!({"server": "cad.example.com:9010"})), "ws://cad.example.com:9010");
     assert_eq!(cloud_server(&json!({"server": "wss://x"})), "wss://x");
 }
+
+/// Presence: what one person points at, has selected and runs reaches the others; someone who
+/// joins later sees where everyone already is; following copies the view until the follower
+/// zooms; an unreachable server fails within the connection timeout.
+#[test]
+fn presence_reaches_the_others_and_follow_copies_the_view() {
+    let url = start_server();
+    let mut a = Session::new();
+    a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    a.execute("collab.join", &json!({"url": url, "name": "Asha", "host": true})).unwrap();
+    let circle = a.state().unwrap().doc.model.last().map(|e| e.handle).unwrap();
+    a.state_mut().unwrap().selection = vec![circle];
+    a.collab_presence(Some(cadcraft_engine::geom::Vec2::new(3.0, 4.0)), 1.0);
+
+    let mut b = Session::new();
+    b.execute("collab.join", &json!({"url": url, "name": "Bo"})).unwrap();
+    let seen = |s: &Session| s.collab_others().into_iter().find(|(p, _)| p.name == "Asha").map(|(_, pr)| pr);
+    wait(&mut b, "Asha's presence at the late joiner", |s| seen(s).is_some_and(|p| p.cursor == Some([3.0, 4.0])));
+    assert_eq!(seen(&b).unwrap().selection, vec![circle]);
+    let peers = b.execute("collab.peers", &json!({})).unwrap();
+    assert_eq!(peers["peers"][0]["cursor"], json!([3.0, 4.0]), "{peers}");
+
+    // Bo follows Asha; her zoom moves his view.
+    b.execute("collab.follow", &json!({"name": "asha"})).unwrap();
+    a.execute("zoom", &json!({"mode": "center", "center": [1, 1], "height": 2})).unwrap();
+    a.collab_presence(None, 2.0);
+    let ha = a.state().unwrap().view().height;
+    wait(&mut b, "Bo's view to follow Asha's", |s| s.state().is_ok_and(|st| (st.view().height - ha).abs() < 1e-9));
+    assert!(b.collab_following().is_some());
+
+    // Bo zooms himself: following stops.
+    b.execute("zoom", &json!({"mode": "extents"})).unwrap();
+    b.collab_tick();
+    assert_eq!(b.collab_following(), None);
+    assert!(b.execute("collab.follow", &json!({"name": "Nobody"})).is_err());
+
+    // A 10.255.255.1-style unroutable address fails within the timeout instead of hanging.
+    let start = Instant::now();
+    assert!(cadcraft_engine::cmd::collab::cloud_connect("ws://10.255.255.1:9/s/x").is_err());
+    assert!(start.elapsed() < Duration::from_secs(20), "connecting took {:?}", start.elapsed());
+}

@@ -703,6 +703,7 @@ impl CadApp {
         self.session.lisp_tick();
         // A shared session's incoming edits, between commands; poll while one is live.
         self.session.collab_tick();
+        cloud::tick(self, ctx);
         if self.session.collab_live() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }

@@ -1116,6 +1116,12 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
             painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Middle);
         }
     }
+    // Other people in a shared session (not inside a layout viewport, whose model space they
+    // don't share coordinates with).
+    app.cloud.cursor = raw_world.filter(|_| active_vp.is_none());
+    if active_vp.is_none() {
+        crate::cloud::paint_presence(app, painter, &xf, rect);
+    }
     paint_pointer_overlay(
         &mut CanvasPaint {
             app,

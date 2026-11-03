@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use cadcraft_collab::client::carry_local;
 use cadcraft_collab::message::{self, ClientMsg, ServerMsg};
-use cadcraft_collab::server::{Server, To};
+use cadcraft_collab::server::Server;
 use cadcraft_collab::{Link, Result};
 use cadcraft_engine::doc::Drawing;
 use cadcraft_engine::{Session, sample};
@@ -61,7 +61,7 @@ impl Net {
             if matches!(msg, ServerMsg::Rejected { .. }) {
                 self.rejected += 1;
             }
-            for m in self.members.iter().filter(|m| m.id.is_some() && (o.to == To::All || o.to == To::One(m.id.unwrap_or(0)))) {
+            for m in self.members.iter().filter(|m| m.id.is_some() && o.to.reaches(m.id.unwrap_or(0))) {
                 m.wire.lock().unwrap().down.push_back(msg.clone());
             }
         }
@@ -82,6 +82,11 @@ impl Net {
                 self.route(out);
             }
             ClientMsg::List => {}
+            ClientMsg::Presence(p) => {
+                let id = self.members[i].id.unwrap();
+                let out = self.server.presence(id, p);
+                self.route(out);
+            }
         }
         true
     }

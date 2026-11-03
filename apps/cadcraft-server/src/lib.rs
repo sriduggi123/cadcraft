@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use cadcraft_collab::message::{self, ClientMsg, FileInfo, MAX_MESSAGE_BYTES, ServerMsg};
-use cadcraft_collab::server::{Outgoing, Server, To};
+use cadcraft_collab::server::{Outgoing, Server};
 use cadcraft_collab::snapshot;
 use cadcraft_doc::Drawing;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -357,6 +357,13 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
             route(room, out);
             Ok(())
         }
+        (ClientMsg::Presence(p), Some(id)) => {
+            let mut all = rooms.lock();
+            let room = all.get_mut(name).ok_or("the session is gone")?;
+            let out = room.server.presence(id, p);
+            route(room, out);
+            Ok(())
+        }
         _ => refuse(tx, "hello comes first, and once"),
     }
 }
@@ -373,7 +380,7 @@ fn route(room: &Room, out: Vec<Outgoing>) {
     for o in out {
         let Ok(bytes) = message::encode(&o.msg) else { continue };
         for (id, tx) in &room.conns {
-            if o.to == To::All || o.to == To::One(*id) {
+            if o.to.reaches(*id) {
                 let _ = tx.send(bytes.clone());
             }
         }

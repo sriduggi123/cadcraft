@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Change, Error, Result};
+use crate::{Change, Error, Handle, Result};
 
 /// Largest message accepted: a welcome carries a whole snapshot.
 pub const MAX_MESSAGE_BYTES: usize = crate::snapshot::MAX_BYTES + (1 << 20);
@@ -20,6 +20,27 @@ pub enum ClientMsg {
     Batch { batch: u64, changes: Vec<Change> },
     /// On the server's file list (`/files`): ask for the list.
     List,
+    /// Where this person is and what they're doing; the server passes it on to the others.
+    Presence(Presence),
+}
+
+/// Most selected objects a presence message carries.
+pub const MAX_SELECTION: usize = 2000;
+
+/// Where someone is and what they're doing (sent often, never part of the drawing).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Presence {
+    /// The layout shown ("" for model space).
+    pub layout: String,
+    /// The cursor in drawing coordinates, while it is over the drawing.
+    pub cursor: Option<[f64; 2]>,
+    /// What is selected (at most [`MAX_SELECTION`]).
+    pub selection: Vec<Handle>,
+    /// The command running, e.g. "LINE".
+    pub command: Option<String>,
+    /// The view: center x, center y and height, in drawing units.
+    pub view: Option<[f64; 3]>,
 }
 
 /// A file in the cloud: a saved or live session.
@@ -57,6 +78,8 @@ pub enum ServerMsg {
     Error { message: String },
     /// The reply to `List`, newest first.
     Files { files: Vec<FileInfo> },
+    /// Someone else's [`Presence`].
+    Presence { client: u32, presence: Presence },
 }
 
 /// Encode a message for the wire.

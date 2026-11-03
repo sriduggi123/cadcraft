@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cadcraft_doc::{Drawing, Handle};
 
-use crate::message::{Peer, ServerMsg};
+use crate::message::{MAX_SELECTION, Peer, Presence, ServerMsg};
 use crate::{Change, Error, Result, apply, snapshot, space};
 
 /// Most changes in one batch.
@@ -17,6 +17,19 @@ pub const MAX_CHANGES: usize = 200_000;
 pub enum To {
     One(u32),
     All,
+    /// Everyone but this client.
+    Others(u32),
+}
+
+impl To {
+    /// Whether a message for `self` goes to `client`.
+    pub fn reaches(self, client: u32) -> bool {
+        match self {
+            To::One(c) => c == client,
+            To::All => true,
+            To::Others(c) => c != client,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +47,8 @@ pub struct Server {
     clients: BTreeMap<u32, String>,
     /// Handles deleted this session: creating one again is allowed to anyone (undo, moves).
     deleted: BTreeSet<Handle>,
+    /// Each person's last presence, for people who join later.
+    presence: BTreeMap<u32, Presence>,
 }
 
 impl Server {
@@ -80,11 +95,26 @@ impl Server {
         self.next_client = self.next_client.checked_add(1).ok_or_else(|| Error::Invalid("no client ids left".into()))?;
         let welcome = ServerMsg::Welcome { client, seq: self.seq, snapshot: snapshot::encode(d)? };
         self.clients.insert(client, name.chars().take(64).collect());
-        Ok((client, vec![Outgoing { to: To::One(client), msg: welcome }, self.peers_msg()]))
+        let mut out = vec![Outgoing { to: To::One(client), msg: welcome }, self.peers_msg()];
+        out.extend(self.presence.iter().map(|(c, p)| Outgoing { to: To::One(client), msg: ServerMsg::Presence { client: *c, presence: p.clone() } }));
+        Ok((client, out))
+    }
+
+    /// Someone's presence: kept, and passed on to everyone else.
+    pub fn presence(&mut self, client: u32, mut presence: Presence) -> Vec<Outgoing> {
+        if !self.clients.contains_key(&client) {
+            return Vec::new();
+        }
+        presence.selection.truncate(MAX_SELECTION);
+        presence.layout = presence.layout.chars().take(256).collect();
+        presence.command = presence.command.map(|c| c.chars().take(64).collect());
+        self.presence.insert(client, presence.clone());
+        vec![Outgoing { to: To::Others(client), msg: ServerMsg::Presence { client, presence } }]
     }
 
     /// Someone leaves (or their link dropped).
     pub fn leave(&mut self, client: u32) -> Vec<Outgoing> {
+        self.presence.remove(&client);
         if self.clients.remove(&client).is_some() { vec![self.peers_msg()] } else { Vec::new() }
     }
 
