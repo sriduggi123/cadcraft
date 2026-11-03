@@ -51,6 +51,8 @@ struct Net {
     server: Server,
     members: Vec<Member>,
     rejected: usize,
+    /// Undos and redos that changed a drawing.
+    undone: usize,
 }
 
 impl Net {
@@ -130,7 +132,7 @@ fn comparable(view: &Drawing, server: &Drawing) -> Drawing {
 }
 
 fn run(seed: u64, clients: usize, steps: usize) -> usize {
-    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0 };
+    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0, undone: 0 };
     net.join(sample::bracket(), true);
     for _ in 1..clients {
         net.join(Drawing::default(), false);
@@ -142,14 +144,25 @@ fn run(seed: u64, clients: usize, steps: usize) -> usize {
     let mut r = Rng(seed);
     for step in 0..steps {
         let i = r.below(clients);
-        match r.below(10) {
+        match r.below(12) {
             0..=4 => {
                 let s = &mut net.members[i].session;
                 let (id, p) = command(&doc(s), &mut r, step * clients + i);
                 let _ = s.execute(id, &p);
                 assert!(s.collab_ended().is_none(), "seed {seed} step {step}: {id} ended the session: {:?}", s.collab_ended());
             }
-            5..=7 => {
+            // Per-person undo and redo, mixed in with everyone's edits.
+            5 | 6 => {
+                let s = &mut net.members[i].session;
+                let id = if r.below(3) == 0 { "redo" } else { "u" };
+                let before = doc(s);
+                let _ = s.execute(id, &serde_json::json!({}));
+                if !Arc::ptr_eq(&before, &doc(s)) {
+                    net.undone += 1;
+                }
+                assert!(s.collab_ended().is_none(), "seed {seed} step {step}: {id} ended the session: {:?}", s.collab_ended());
+            }
+            7..=9 => {
                 for _ in 0..1 + r.below(3) {
                     net.deliver(i);
                 }
@@ -168,6 +181,7 @@ fn run(seed: u64, clients: usize, steps: usize) -> usize {
             panic!("seed {seed}: client {k} differs from the server: {left:#?}");
         }
     }
+    assert!(net.undone > 0, "seed {seed}: no undo or redo changed anything");
     net.rejected
 }
 
@@ -188,13 +202,84 @@ fn many_clients_converge() {
     }
 }
 
+fn count(s: &Session, kind: &str) -> usize {
+    doc(s).model.iter().filter(|e| e.kind.dxf_name() == kind).count()
+}
+
+/// U takes back only its author's step: someone else's later edit stays, on every copy. REDO
+/// brings it back. A change someone else made since is left as they made it.
 #[test]
-fn undo_is_refused_in_a_shared_session() {
-    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0 };
+fn undo_takes_back_only_your_own_steps() {
+    use serde_json::json;
+    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0, undone: 0 };
     net.join(Drawing::default(), true);
+    net.join(Drawing::default(), false);
     net.quiesce();
-    let s = &mut net.members[0].session;
-    s.execute("line", &serde_json::json!({"points": [[0, 0], [1, 1]]})).unwrap();
-    assert!(s.undo().is_err());
-    assert!(s.execute("u", &serde_json::json!({})).is_err());
+    net.members[0].session.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    net.quiesce();
+    net.members[1].session.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    net.quiesce();
+
+    net.members[0].session.execute("u", &json!({})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!((count(&m.session, "CIRCLE"), count(&m.session, "LINE")), (0, 1), "the circle is undone, Bo's line stays");
+    }
+    net.members[0].session.execute("redo", &json!({})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!((count(&m.session, "CIRCLE"), count(&m.session, "LINE")), (1, 1));
+    }
+
+    // Asha colours the line red; Bo then makes it blue. Asha's undo leaves Bo's blue.
+    let line = doc(&net.members[0].session).model.iter().find(|e| e.kind.dxf_name() == "LINE").map(|e| e.handle.hex()).unwrap();
+    net.members[0].session.execute("properties.set", &json!({"handles": [line], "color": 1})).unwrap();
+    net.quiesce();
+    net.members[1].session.execute("properties.set", &json!({"handles": [line], "color": 5})).unwrap();
+    net.quiesce();
+    net.members[0].session.execute("u", &json!({})).unwrap();
+    net.quiesce();
+    let colour = |s: &Session| doc(s).model.iter().find(|e| e.handle.hex() == line).map(|e| format!("{:?}", e.common.color)).unwrap();
+    let blue = colour(&net.members[1].session);
+    assert_eq!(colour(&net.members[0].session), blue);
+    assert!(net.members[0].session.log.iter().any(|l| l.contains("left as they are")), "Asha is told");
+    assert_eq!(net.server.drawing().map(|d| d.model.len()), Some(2));
+}
+
+/// An UNDO BEgin/End group and a LISP routine each undo as one step.
+#[test]
+fn a_group_and_a_lisp_routine_undo_as_one_step() {
+    use serde_json::json;
+    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0, undone: 0 };
+    net.join(Drawing::default(), true);
+    net.join(Drawing::default(), false);
+    net.quiesce();
+    let a = &mut net.members[0].session;
+    a.execute("undo", &json!({"mode": "begin"})).unwrap();
+    a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    net.quiesce();
+    // Bo draws in the middle of Asha's group.
+    net.members[1].session.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    net.quiesce();
+    let a = &mut net.members[0].session;
+    a.execute("circle", &json!({"center": [20, 0], "radius": 5})).unwrap();
+    a.execute("undo", &json!({"mode": "end"})).unwrap();
+    a.execute("u", &json!({})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!((count(&m.session, "CIRCLE"), count(&m.session, "LINE")), (0, 1), "both circles go, Bo's line stays");
+    }
+
+    let a = &mut net.members[0].session;
+    a.cmdline("(progn (command \"circle\" \"0,0\" \"3\") (command \"circle\" \"9,0\" \"3\"))").unwrap();
+    while a.lisp_busy() {
+        a.lisp_tick();
+    }
+    net.quiesce();
+    assert_eq!(count(&net.members[1].session, "CIRCLE"), 2);
+    net.members[0].session.execute("u", &json!({})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!((count(&m.session, "CIRCLE"), count(&m.session, "LINE")), (0, 1), "the routine's two circles undo together");
+    }
 }

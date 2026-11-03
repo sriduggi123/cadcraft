@@ -6,6 +6,16 @@ pub struct Snapshot {
     pub label: String,
     pub doc: Arc<Drawing>,
     pub selection: Vec<Handle>,
+    /// The step as the drawing before and after each of its parts, oldest first (one part per
+    /// command; an UNDO group or LISP routine has several). A shared drawing's undo reverses these
+    /// instead of swapping `doc` back, which would take back other people's edits too.
+    pub parts: Vec<(Arc<Drawing>, Arc<Drawing>)>,
+}
+
+impl Snapshot {
+    pub fn new(label: impl Into<String>, doc: Arc<Drawing>, selection: Vec<Handle>) -> Snapshot {
+        Snapshot { label: label.into(), doc, selection, parts: Vec::new() }
+    }
 }
 
 /// One open drawing.
@@ -78,7 +88,7 @@ impl DocState {
     /// Show the drawing an undo or redo step holds, with nothing selected; returns the drawing as
     /// it was, as the step back.
     pub(crate) fn swap_in(&mut self, snap: Snapshot) -> Snapshot {
-        let cur = Snapshot { label: snap.label, doc: std::mem::replace(&mut self.doc, snap.doc), selection: std::mem::take(&mut self.selection) };
+        let cur = Snapshot::new(snap.label, std::mem::replace(&mut self.doc, snap.doc), std::mem::take(&mut self.selection));
         self.follow_layout(&cur.doc);
         self.revision += 1;
         cur

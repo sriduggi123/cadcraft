@@ -393,7 +393,7 @@ impl Session {
             {
                 st.revision += 1;
                 if self.suspended.is_none() {
-                    self.lisp_record_step(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
+                    self.lisp_record_step(Snapshot::new(label, run.before, run.selection_before));
                 }
             }
             return;
@@ -401,7 +401,7 @@ impl Session {
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {
-            st.push_undo(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
+            st.push_undo(Snapshot::new(label, run.before, run.selection_before));
             st.revision += 1;
         }
     }

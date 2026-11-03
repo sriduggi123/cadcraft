@@ -4,9 +4,9 @@
 //! [`Session::collab_tick`] applies what the server sent. Nothing arrives while a command runs, so
 //! a command never sees the drawing change under it.
 //!
-//! Snapshot undo would take back other people's edits, so U, UNDO and REDO are refused in a
-//! session until per-user undo lands (P4), and so are the Block Editor and REFEDIT, which swap the
-//! whole drawing (P5).
+//! Undo in a session takes back only this person's steps ([`DocState::revert_in`]): swapping the
+//! drawing back would take back other people's edits too. The Block Editor and REFEDIT, which
+//! swap the whole drawing, are refused (P5).
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ const MAX_PER_TICK: usize = 256;
 const PRESENCE_EVERY: f64 = 0.05;
 
 /// Commands that can't run in a shared session yet.
-const REFUSED: &[&str] = &["bedit", "refedit", "undo", "u", "redo", "mredo", "oops"];
+const REFUSED: &[&str] = &["bedit", "refedit"];
 
 /// The live session of one drawing.
 pub struct Live {
@@ -107,10 +107,22 @@ impl Session {
         self.collab = None;
     }
 
+    /// Whether the active drawing is the shared one.
+    pub(crate) fn collab_shares_active(&self) -> bool {
+        self.collab_live() && self.state().is_ok_and(|st| self.collab.as_ref().is_some_and(|l| l.uid == st.uid))
+    }
+
+    /// Tell the person what an undo left because someone changed it since.
+    pub(crate) fn note_left(&mut self, left: usize) {
+        if left > 0 {
+            let what = if left == 1 { "1 change was".to_string() } else { format!("{left} changes were") };
+            self.echo(format!("{what} left as they are: someone else changed the same thing since."));
+        }
+    }
+
     /// Whether `id` is refused while the active drawing is shared.
     pub(crate) fn collab_refuses(&self, id: &str) -> Option<String> {
-        let shared = self.collab_live() && self.state().is_ok_and(|st| self.collab.as_ref().is_some_and(|l| l.uid == st.uid));
-        (shared && REFUSED.contains(&id)).then(|| format!("{} isn't available in a shared session yet", id.to_ascii_uppercase()))
+        (self.collab_shares_active() && REFUSED.contains(&id)).then(|| format!("{} isn't available in a shared session yet", id.to_ascii_uppercase()))
     }
 
     /// Apply what the server sent. Call between commands (the UI calls it every frame).
@@ -284,4 +296,32 @@ fn layout_name(space: &Space) -> String {
 fn same_view(a: &View, b: &View) -> bool {
     let tol = 1e-9 * a.height.abs().max(b.height.abs()).max(1.0);
     (a.center.x - b.center.x).abs() <= tol && (a.center.y - b.center.y).abs() <= tol && (a.height - b.height).abs() <= tol
+}
+
+impl crate::DocState {
+    /// Take back undo or redo step `snap` in a shared drawing: reverse what its parts changed,
+    /// newest first, leaving what someone changed since. Returns the step that brings it back and
+    /// how many changes were left. A step from before the session (it has no parts) can't be
+    /// taken back this way.
+    pub(crate) fn revert_in(&mut self, snap: &crate::Snapshot) -> std::result::Result<(crate::Snapshot, usize), String> {
+        if snap.parts.is_empty() {
+            return Err("this step was made before the drawing was shared".into());
+        }
+        let now = self.doc.clone();
+        let mut d = (*now).clone();
+        let mut left = 0;
+        for (before, after) in snap.parts.iter().rev() {
+            let (next, n) = cadcraft_collab::undo::revert(&d, before, after).map_err(|e| e.to_string())?;
+            d = next;
+            left += n;
+        }
+        let new = Arc::new(d);
+        self.doc = new.clone();
+        let selection = std::mem::take(&mut self.selection);
+        self.follow_layout(&now);
+        self.revision += 1;
+        let mut back = crate::Snapshot::new(snap.label.clone(), now.clone(), selection);
+        back.parts.push((now, new));
+        Ok((back, left))
+    }
 }

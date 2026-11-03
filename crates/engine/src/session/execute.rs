@@ -76,7 +76,7 @@ impl Session {
             && let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&doc, &st.doc)
         {
-            let snap = Snapshot { label: spec.label.to_string(), doc, selection: sel };
+            let snap = Snapshot::new(spec.label, doc, sel);
             // Inside a LISP routine the routine's single undo step records it, and the routine
             // keeps it for U inside it.
             if grouped {
@@ -107,35 +107,53 @@ impl Session {
     /// Take the last step back. Inside a LISP routine, the routine's last command first; past
     /// those, the drawing's step before the routine, which then starts from there.
     pub fn undo(&mut self) -> Result<Option<String>> {
-        if let Some(why) = self.collab_refuses("undo") {
-            return Err(EngineError::Disabled("undo".into(), why));
-        }
         if let Some(label) = self.lisp_take_back(false) {
             return Ok(Some(label));
         }
+        let shared = self.collab_shares_active();
         let st = self.state_mut()?;
         let Some(snap) = st.undo.pop() else { return Ok(None) };
-        let cur = st.swap_in(snap);
+        let (cur, left) = if shared {
+            match st.revert_in(&snap) {
+                Ok(r) => r,
+                Err(e) => {
+                    st.undo.push(snap);
+                    return Err(EngineError::Other(e));
+                }
+            }
+        } else {
+            (st.swap_in(snap), 0)
+        };
         let label = cur.label.clone();
         st.redo.push(cur);
         self.lisp_rebase();
+        self.note_left(left);
         Ok(Some(label))
     }
 
     /// Bring back what the last undo took back; inside a LISP routine, what U inside it took first.
     pub fn redo(&mut self) -> Result<Option<String>> {
-        if let Some(why) = self.collab_refuses("redo") {
-            return Err(EngineError::Disabled("redo".into(), why));
-        }
         if let Some(label) = self.lisp_take_back(true) {
             return Ok(Some(label));
         }
+        let shared = self.collab_shares_active();
         let st = self.state_mut()?;
         let Some(snap) = st.redo.pop() else { return Ok(None) };
-        let cur = st.swap_in(snap);
+        let (cur, left) = if shared {
+            match st.revert_in(&snap) {
+                Ok(r) => r,
+                Err(e) => {
+                    st.redo.push(snap);
+                    return Err(EngineError::Other(e));
+                }
+            }
+        } else {
+            (st.swap_in(snap), 0)
+        };
         let label = cur.label.clone();
         st.undo.push(cur);
         self.lisp_rebase();
+        self.note_left(left);
         Ok(Some(label))
     }
 }

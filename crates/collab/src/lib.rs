@@ -16,6 +16,7 @@
 //!   rest to everyone; [`client::Client`] shows its own edits at once and rebuilds its view when
 //!   someone else's batch arrives. Both are pure state machines; a [`Link`] carries the
 //!   [`message`]s.
+//! - [`undo::revert`] takes back one person's step without touching what others did since.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -31,6 +32,7 @@ pub mod message;
 pub mod server;
 pub mod snapshot;
 pub mod space;
+pub mod undo;
 pub mod vars;
 
 pub use apply::apply;

@@ -77,8 +77,12 @@ impl DocState {
     /// Record an undo step (`snap` holds the drawing as it was before the change) and clear redo.
     /// UNDO Control None records nothing and One keeps just this step; the stack holds at most
     /// [`MAX_UNDO`] steps.
-    pub fn push_undo(&mut self, snap: Snapshot) {
+    pub fn push_undo(&mut self, mut snap: Snapshot) {
         self.redo.clear();
+        // Called once the change is made: the drawing now is the step's result.
+        if snap.parts.is_empty() {
+            snap.parts.push((snap.doc.clone(), self.doc.clone()));
+        }
         match self.undo_ctl.control {
             Control::None => {
                 self.undo.clear();
@@ -143,9 +147,10 @@ impl DocState {
         let Some(start) = self.undo_ctl.group.take() else { return false };
         // The first step of the group holds the drawing as it was at BEgin.
         if self.undo.len() > start {
-            self.undo.truncate(start + 1);
+            let later: Vec<_> = self.undo.drain(start + 1..).flat_map(|s| s.parts).collect();
             if let Some(first) = self.undo.get_mut(start) {
                 first.label = "Group".into();
+                first.parts.extend(later);
             }
         }
         // States inside the group no longer exist.
