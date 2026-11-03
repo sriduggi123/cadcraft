@@ -44,7 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// The server used when none is given: `$CADCRAFT_CLOUD`, else this.
-pub const DEFAULT_SERVER: &str = "ws://127.0.0.1:9010";
+pub const DEFAULT_SERVER: &str = "wss://cad.dotai.co.in";
 
 /// A server address as `ws://` or `wss://` without a trailing `/`. `https`/`http` become
 /// `wss`/`ws`; a bare host is `wss://`, except a local one or one with a port (`ws://`).
