@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use cadcraft_doc::{Drawing, Handle};
 
 use crate::message::{MAX_SELECTION, Peer, Presence, ServerMsg};
-use crate::{Change, Error, Result, apply, snapshot, space};
+use crate::{Change, Container, Error, Result, apply, snapshot, space};
 
 /// Most changes in one batch.
 pub const MAX_CHANGES: usize = 200_000;
+/// Most blocks locked at once in one session.
+const MAX_LOCKS: usize = 1000;
 
 /// Who a reply goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub struct Server {
     deleted: BTreeSet<Handle>,
     /// Each person's last presence, for people who join later.
     presence: BTreeMap<u32, Presence>,
+    /// Blocks locked for the Block Editor (by name in lower case) and who holds each.
+    locks: BTreeMap<String, u32>,
 }
 
 impl Server {
@@ -97,7 +101,33 @@ impl Server {
         self.clients.insert(client, name.chars().take(64).collect());
         let mut out = vec![Outgoing { to: To::One(client), msg: welcome }, self.peers_msg()];
         out.extend(self.presence.iter().map(|(c, p)| Outgoing { to: To::One(client), msg: ServerMsg::Presence { client: *c, presence: p.clone() } }));
+        if !self.locks.is_empty() {
+            out.push(Outgoing { to: To::One(client), msg: self.locks_msg() });
+        }
         Ok((client, out))
+    }
+
+    /// Lock or unlock a block for `client`. A block someone else holds stays theirs; everyone
+    /// gets the lock list either way, so the asker sees who has it.
+    pub fn lock(&mut self, client: u32, block: &str, on: bool) -> Vec<Outgoing> {
+        if !self.clients.contains_key(&client) {
+            return Vec::new();
+        }
+        let key = block.to_lowercase();
+        match (on, self.locks.get(&key)) {
+            (true, None) if self.locks.len() < MAX_LOCKS => {
+                self.locks.insert(key.chars().take(256).collect(), client);
+            }
+            (false, Some(c)) if *c == client => {
+                self.locks.remove(&key);
+            }
+            _ => {}
+        }
+        vec![Outgoing { to: To::All, msg: self.locks_msg() }]
+    }
+
+    fn locks_msg(&self) -> ServerMsg {
+        ServerMsg::Locks { locks: self.locks.iter().map(|(b, c)| (b.clone(), *c)).collect() }
     }
 
     /// Someone's presence: kept, and passed on to everyone else.
@@ -115,7 +145,13 @@ impl Server {
     /// Someone leaves (or their link dropped).
     pub fn leave(&mut self, client: u32) -> Vec<Outgoing> {
         self.presence.remove(&client);
-        if self.clients.remove(&client).is_some() { vec![self.peers_msg()] } else { Vec::new() }
+        let held = self.locks.len();
+        self.locks.retain(|_, c| *c != client);
+        let mut out = if self.clients.remove(&client).is_some() { vec![self.peers_msg()] } else { Vec::new() };
+        if self.locks.len() != held {
+            out.push(Outgoing { to: To::All, msg: self.locks_msg() });
+        }
+        out
     }
 
     fn peers_msg(&self) -> Outgoing {
@@ -123,7 +159,7 @@ impl Server {
     }
 
     /// A batch from `client`: accepted and sent to everyone, or refused to its author.
-    pub fn batch(&mut self, client: u32, batch: u64, changes: Vec<Change>) -> Vec<Outgoing> {
+    pub fn batch(&mut self, client: u32, batch: u64, base: u64, changes: Vec<Change>) -> Vec<Outgoing> {
         match self.check(client, &changes) {
             Ok(d) => {
                 self.drawing = Some(d);
@@ -132,7 +168,7 @@ impl Server {
                     _ => None,
                 }));
                 self.seq += 1;
-                vec![Outgoing { to: To::All, msg: ServerMsg::Accepted { seq: self.seq, client, batch, changes } }]
+                vec![Outgoing { to: To::All, msg: ServerMsg::Accepted { seq: self.seq, client, batch, base: base.min(self.seq), changes } }]
             }
             Err(e) => vec![Outgoing { to: To::One(client), msg: ServerMsg::Rejected { batch, reason: e.to_string() } }],
         }
@@ -148,6 +184,19 @@ impl Server {
         }
         let mut deleted_here = BTreeSet::new();
         for c in changes {
+            let block = match c {
+                Change::Block { name, .. } => Some(name),
+                Change::Create { container: Container::Block { name }, .. } | Change::Order { container: Container::Block { name }, .. } => {
+                    Some(name)
+                }
+                _ => None,
+            };
+            if let Some(name) = block
+                && let Some(holder) = self.locks.get(&name.to_lowercase()).filter(|h| **h != client)
+            {
+                let who = self.clients.get(holder).cloned().unwrap_or_default();
+                return Err(Error::Invalid(format!("block {name} is being edited by {who}")));
+            }
             match c {
                 Change::Delete { id } => {
                     deleted_here.insert(*id);

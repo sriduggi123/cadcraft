@@ -350,10 +350,17 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
             route(room, out);
             Ok(())
         }
-        (ClientMsg::Batch { batch, changes }, Some(id)) => {
+        (ClientMsg::Batch { batch, base, changes }, Some(id)) => {
             let mut all = rooms.lock();
             let room = all.get_mut(name).ok_or("the session is gone")?;
-            let out = room.server.batch(id, batch, changes);
+            let out = room.server.batch(id, batch, base, changes);
+            route(room, out);
+            Ok(())
+        }
+        (ClientMsg::Lock { block, on }, Some(id)) => {
+            let mut all = rooms.lock();
+            let room = all.get_mut(name).ok_or("the session is gone")?;
+            let out = room.server.lock(id, &block, on);
             route(room, out);
             Ok(())
         }

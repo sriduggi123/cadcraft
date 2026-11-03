@@ -20,7 +20,7 @@ pub fn apply(d: &mut Drawing, changes: &[Change]) -> Result<()> {
 
 /// Apply what still applies of `changes`, skipping a change that fails (each change is applied
 /// whole or not at all). The client uses it to show its pending edits on top of others' edits.
-pub(crate) fn apply_lenient(d: &mut Drawing, changes: &[Change]) {
+pub fn apply_lenient(d: &mut Drawing, changes: &[Change]) {
     for c in changes {
         let _ = apply_one(d, c);
     }
@@ -39,6 +39,7 @@ fn apply_one(d: &mut Drawing, c: &Change) -> Result<()> {
         Change::Order { container, ids } => order(d, container, ids),
         Change::Var { name, value } => var(d, name, value.as_ref()),
         Change::Doc { field, value } => docfields::apply(d, field, value),
+        Change::Entry { field, name, value } => docfields::apply_entry(d, field, name, value.as_ref()),
     }
 }
 

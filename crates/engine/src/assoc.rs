@@ -239,8 +239,6 @@ fn src_changed(before: &Drawing, after: &Drawing, h: Handle) -> bool {
 /// `prev` is the dimension as it was before the change (when it existed).
 pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, after: &Drawing) -> Dimension {
     let mut nd = dm.clone();
-    let mut deltas: Vec<Vec2> = Vec::new();
-    let mut moved: Vec<String> = Vec::new();
     let was = prev.unwrap_or(dm);
     nd.assoc.retain(|a| {
         let Some(old) = def_point(was, &a.point) else { return false };
@@ -252,6 +250,15 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
         }
         snap_point(after, a).is_some()
     });
+    follow(&mut nd, dm, after);
+    nd
+}
+
+/// Move `nd`'s attached definition points onto their objects in `after` (`dm` is the dimension
+/// before), carrying the rest of the dimension along when every attached point moved alike.
+fn follow(nd: &mut Dimension, dm: &Dimension, after: &Drawing) {
+    let mut deltas: Vec<Vec2> = Vec::new();
+    let mut moved: Vec<String> = Vec::new();
     for a in &nd.assoc {
         if let (Some(p), Some(old)) = (snap_point(after, a), def_point(dm, &a.point)) {
             deltas.push(p - old.xy());
@@ -259,7 +266,7 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
         }
     }
     for a in nd.assoc.clone() {
-        if let (Some(p), Some(slot)) = (snap_point(after, &a), def_point_mut(&mut nd, &a.point)) {
+        if let (Some(p), Some(slot)) = (snap_point(after, &a), def_point_mut(nd, &a.point)) {
             slot.x = p.x;
             slot.y = p.y;
         }
@@ -276,7 +283,7 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
         for name in POINTS {
             if !(moved.iter().any(|m| m == name) || ordinate && name == "defpt")
                 && !(linear && (name == "p13" || name == "p14"))
-                && let Some(slot) = def_point_mut(&mut nd, name)
+                && let Some(slot) = def_point_mut(nd, name)
             {
                 slot.x += first.x;
                 slot.y += first.y;
@@ -285,10 +292,56 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
         nd.text_mid.x += first.x;
         nd.text_mid.y += first.y;
     }
-    if nd != *dm {
+    if *nd != *dm {
         nd.block = None;
     }
-    nd
+}
+
+/// Repair after two people edited at once: an associative dimension that `suspect` names (one
+/// person changed it while another changed its objects; it gets the dimension and its objects)
+/// and whose attached points are off its objects follows them again. A dimension moved off its
+/// object on purpose is never suspect. Returns the number of dimensions repaired.
+pub fn repair(after: &mut Arc<Drawing>, suspect: impl Fn(Handle, &[Handle]) -> bool) -> usize {
+    let mut changes: Vec<(Handle, Dimension)> = Vec::new();
+    {
+        let d: &Drawing = after;
+        for store in std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)) {
+            for e in store.iter() {
+                let EntityKind::Dimension(dm) = &e.kind else { continue };
+                let sources: Vec<Handle> = dm
+                    .assoc
+                    .iter()
+                    .flat_map(|a| match a.snap {
+                        AssocSnap::Intersection { other } => vec![a.handle, other],
+                        _ => vec![a.handle],
+                    })
+                    .collect();
+                if sources.is_empty() || !suspect(e.handle, &sources) {
+                    continue;
+                }
+                let off = dm.assoc.iter().any(|a| match (snap_point(d, a), def_point(dm, &a.point)) {
+                    (Some(p), Some(q)) => !close(p, q.xy()),
+                    _ => false,
+                });
+                if off {
+                    let mut nd = dm.clone();
+                    nd.assoc.retain(|a| snap_point(d, a).is_some());
+                    follow(&mut nd, dm, d);
+                    if nd != *dm {
+                        changes.push((e.handle, nd));
+                    }
+                }
+            }
+        }
+    }
+    let n = changes.len();
+    if n > 0 {
+        let d = Arc::make_mut(after);
+        for (h, nd) in changes {
+            let _ = d.modify_entity(h, |e| e.kind = EntityKind::Dimension(nd));
+        }
+    }
+    n
 }
 
 /// After a change: update every associative dimension whose objects changed.

@@ -78,12 +78,17 @@ impl Net {
                 self.members[i].id = Some(id);
                 self.route(out);
             }
-            ClientMsg::Batch { batch, changes } => {
+            ClientMsg::Batch { batch, base, changes } => {
                 let id = self.members[i].id.unwrap();
-                let out = self.server.batch(id, batch, changes);
+                let out = self.server.batch(id, batch, base, changes);
                 self.route(out);
             }
             ClientMsg::List => {}
+            ClientMsg::Lock { block, on } => {
+                let id = self.members[i].id.unwrap();
+                let out = self.server.lock(id, &block, on);
+                self.route(out);
+            }
             ClientMsg::Presence(p) => {
                 let id = self.members[i].id.unwrap();
                 let out = self.server.presence(id, p);
@@ -282,4 +287,136 @@ fn a_group_and_a_lisp_routine_undo_as_one_step() {
     for m in &net.members {
         assert_eq!((count(&m.session, "CIRCLE"), count(&m.session, "LINE")), (0, 1), "the routine's two circles undo together");
     }
+}
+
+fn two_people() -> Net {
+    let mut net = Net { server: Server::new(None), members: Vec::new(), rejected: 0, undone: 0 };
+    net.join(Drawing::default(), true);
+    net.join(Drawing::default(), false);
+    net.quiesce();
+    net
+}
+
+fn dim_points(s: &Session) -> ([f64; 2], [f64; 2]) {
+    let d = doc(s);
+    let dm = d
+        .model
+        .iter()
+        .find_map(|e| match &e.kind {
+            cadcraft_doc::EntityKind::Dimension(dm) => Some(dm.clone()),
+            _ => None,
+        })
+        .unwrap();
+    ([dm.p13.x, dm.p13.y], [dm.p14.x, dm.p14.y])
+}
+
+/// P5: Asha moves a line while Bo, at the same moment, moves its dimension: Bo's dimension
+/// lands last with the line's old ends, and the repair puts it back on the line, everywhere.
+/// A dimension moved off its line by itself, with nobody editing at the same time, stays put.
+#[test]
+fn a_dimension_broken_by_two_edits_at_once_is_repaired() {
+    use serde_json::json;
+    let mut net = two_people();
+    let a = &mut net.members[0].session;
+    a.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    a.execute("dimlinear", &json!({"p1": [0, 0], "p2": [10, 0], "at": [5, 4]})).unwrap();
+    net.quiesce();
+    let handles: Vec<String> = doc(&net.members[0].session).model.iter().map(|e| e.handle.hex()).collect();
+    let (line, dim) = (handles[0].clone(), handles[1].clone());
+    assert_eq!(dim_points(&net.members[1].session), ([0.0, 0.0], [10.0, 0.0]));
+
+    // Both edit before either sees the other's edit; Asha's reaches the server first.
+    net.members[0].session.execute("move", &json!({"handles": [line], "delta": [0, -3]})).unwrap();
+    net.members[1].session.execute("move", &json!({"handles": [dim], "delta": [1, 1]})).unwrap();
+    net.deliver(0);
+    net.deliver(1);
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!(dim_points(&m.session), ([0.0, -3.0], [10.0, -3.0]), "the dimension measures the moved line again");
+    }
+
+    // Bo moves the dimension alone: nothing is repaired.
+    net.members[1].session.execute("move", &json!({"handles": [dim], "delta": [0, 2]})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!(dim_points(&m.session), ([0.0, -1.0], [10.0, -1.0]));
+    }
+}
+
+/// P5: Asha renames layer Walls while Bo draws on it: Bo's line ends up on the new name, and no
+/// empty Walls layer comes back. Two people changing different layers keep both changes.
+#[test]
+fn tables_sync_by_entry_and_drawing_follows_a_rename() {
+    use serde_json::json;
+    let mut net = two_people();
+    net.members[0].session.execute("layer.new", &json!({"name": "Walls", "color": 1})).unwrap();
+    net.members[0].session.execute("layer.new", &json!({"name": "Doors", "color": 2})).unwrap();
+    net.quiesce();
+    net.members[1].session.execute("layer.current", &json!({"name": "Walls"})).unwrap();
+
+    net.members[0].session.execute("rename", &json!({"table": "layer", "from": "Walls", "to": "Walls-2"})).unwrap();
+    net.members[1].session.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    net.deliver(0);
+    net.deliver(1);
+    net.quiesce();
+    for m in &net.members {
+        let d = doc(&m.session);
+        assert!(d.layer("Walls").is_none(), "no Walls layer comes back");
+        assert_eq!(d.model.iter().map(|e| e.common.layer.clone()).collect::<Vec<_>>(), vec!["Walls-2".to_string()]);
+    }
+
+    // Different layers at once: both changes stay.
+    net.members[0].session.execute("layer.set", &json!({"name": "Walls-2", "color": 5})).unwrap();
+    net.members[1].session.execute("layer.set", &json!({"name": "Doors", "color": 6})).unwrap();
+    let colour = |s: &Session, n: &str| doc(s).layer(n).map(|l| format!("{:?}", l.color)).unwrap();
+    let want = (colour(&net.members[0].session, "Walls-2"), colour(&net.members[1].session, "Doors"));
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!((colour(&m.session, "Walls-2"), colour(&m.session, "Doors")), want, "both layer changes stay");
+    }
+}
+
+fn block_len(s: &Session, name: &str) -> usize {
+    s.state().unwrap().drawing().block(name).map_or(0, |b| b.entities.len())
+}
+
+/// P5: the Block Editor locks its block. Someone else can't open it meanwhile, and their other
+/// edits (a layer change) arrive and survive Asha's save; after BCLOSE the lock is gone.
+#[test]
+fn the_block_editor_locks_its_block() {
+    use serde_json::json;
+    let mut net = two_people();
+    let a = &mut net.members[0].session;
+    a.execute("circle", &json!({"center": [0, 0], "radius": 1})).unwrap();
+    let h = doc(a).model.iter().next().map(|e| e.handle.hex()).unwrap();
+    a.execute("block", &json!({"name": "Bolt", "base": [0, 0], "handles": [h]})).unwrap();
+    a.execute("layer.new", &json!({"name": "Walls", "color": 1})).unwrap();
+    net.quiesce();
+
+    net.members[0].session.execute("bedit", &json!({"name": "Bolt"})).unwrap();
+    net.members[0].session.execute("line", &json!({"points": [[0, 0], [2, 2]]})).unwrap();
+    net.quiesce();
+    assert_eq!(block_len(&net.members[1].session, "Bolt"), 1, "nothing leaves the editor before a save");
+
+    // Bo can't open Bolt; his layer change arrives behind Asha's editor.
+    let b = &mut net.members[1].session;
+    let _ = b.execute("bedit", &json!({"name": "Bolt"}));
+    b.collab_tick();
+    assert!(b.state().unwrap().block_edit.is_none(), "Bo's editor closed again");
+    assert!(b.log.iter().any(|l| l.contains("being edited by user0")), "{:?}", b.log);
+    b.execute("layer.set", &json!({"name": "Walls", "color": 5})).unwrap();
+    let blue = doc(b).layer("Walls").map(|l| format!("{:?}", l.color)).unwrap();
+    net.quiesce();
+
+    net.members[0].session.execute("bclose", &json!({"save": true})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!(block_len(&m.session, "Bolt"), 2, "the saved block reaches everyone");
+        assert_eq!(doc(&m.session).layer("Walls").map(|l| format!("{:?}", l.color)), Some(blue.clone()), "Bo's layer change survives the save");
+    }
+
+    // The lock is gone: Bo can edit Bolt now.
+    net.members[1].session.execute("bedit", &json!({"name": "Bolt"})).unwrap();
+    net.members[1].session.collab_tick();
+    assert!(net.members[1].session.state().unwrap().block_edit.is_some());
 }

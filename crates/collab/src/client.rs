@@ -3,12 +3,18 @@
 //! else's batch arrives, the view is rebuilt as the confirmed drawing with the pending batches
 //! replayed on top, so a pending edit never flickers away.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, Handle};
 
 use crate::message::{ClientMsg, Peer, Presence, ServerMsg};
 use crate::{Change, Error, Result, apply, diff, snapshot, space, vars};
+
+/// Most renames remembered, and the longest chain of them followed.
+const MAX_RENAMES: usize = 10_000;
+const MAX_RENAME_CHAIN: usize = 64;
+/// Accepted batches remembered to find the ones made at the same time.
+const MAX_RECENT: usize = 256;
 
 #[derive(Debug)]
 pub struct Client {
@@ -20,6 +26,14 @@ pub struct Client {
     peers: Vec<Peer>,
     /// The others' presence, by client.
     others: BTreeMap<u32, Presence>,
+    /// Table entries renamed in this session: (field, old name) → new name.
+    renames: BTreeMap<(String, String), String>,
+    /// The last accepted batches: (seq, author, objects touched).
+    recent: VecDeque<(u64, u32, BTreeSet<Handle>)>,
+    /// Blocks locked for the Block Editor (lower case) and who holds each.
+    locks: BTreeMap<String, u32>,
+    /// See [`Client::take_concurrent`].
+    concurrent: Vec<(BTreeSet<Handle>, BTreeSet<Handle>)>,
     notices: Vec<String>,
 }
 
@@ -45,6 +59,10 @@ impl Client {
             next_batch: 1,
             peers: Vec::new(),
             others: BTreeMap::new(),
+            renames: BTreeMap::new(),
+            recent: VecDeque::new(),
+            locks: BTreeMap::new(),
+            concurrent: Vec::new(),
             notices: Vec::new(),
         };
         Ok((c, view))
@@ -68,6 +86,61 @@ impl Client {
         &self.others
     }
 
+    /// What table entry `name` of `field` is called now, after the renames seen in this session.
+    pub fn renamed(&self, field: &str, name: &str) -> Option<&str> {
+        let mut at = self.renames.get(&(field.to_string(), name.to_string()))?;
+        for _ in 0..MAX_RENAME_CHAIN {
+            match self.renames.get(&(field.to_string(), at.clone())) {
+                Some(next) if next != name => at = next,
+                _ => break,
+            }
+        }
+        Some(at.as_str())
+    }
+
+    /// Pairs of objects that batches made at the same time touched (one batch's, the other's),
+    /// each once: where a dimension and its object, or a hatch and its boundary, were edited by
+    /// two people at once and may no longer agree.
+    pub fn take_concurrent(&mut self) -> Vec<(BTreeSet<Handle>, BTreeSet<Handle>)> {
+        std::mem::take(&mut self.concurrent)
+    }
+
+    fn note_concurrent(&mut self, seq: u64, client: u32, base: u64, changes: &[Change]) {
+        let touched: BTreeSet<Handle> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Delete { id } | Change::Create { id, .. } | Change::Common { id, .. } | Change::Geometry { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for (s, who, other) in &self.recent {
+            if *s > base && *who != client && self.concurrent.len() < MAX_RECENT {
+                self.concurrent.push((touched.clone(), other.clone()));
+            }
+        }
+        self.recent.push_back((seq, client, touched));
+        if self.recent.len() > MAX_RECENT {
+            self.recent.pop_front();
+        }
+    }
+
+    fn note_renames(&mut self, changes: &[Change]) {
+        for c in changes {
+            if let Change::Entry { field, name, value: Some(v) } = c
+                && let Some(new) = v.0.get("name").and_then(serde_json::Value::as_str)
+                && new != name
+                && self.renames.len() < MAX_RENAMES
+            {
+                self.renames.insert((field.clone(), name.clone()), new.to_string());
+            }
+        }
+    }
+
+    /// Who holds the lock on block `name`, if anyone.
+    pub fn lock_holder(&self, name: &str) -> Option<u32> {
+        self.locks.get(&name.to_lowercase()).copied()
+    }
+
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
@@ -86,14 +159,16 @@ impl Client {
         let batch = self.next_batch;
         self.next_batch += 1;
         self.pending.push_back((batch, changes.clone()));
-        Ok(Some(ClientMsg::Batch { batch, changes }))
+        Ok(Some(ClientMsg::Batch { batch, base: self.seq, changes }))
     }
 
     /// A message from the server. `view` is the drawing shown now.
     pub fn receive(&mut self, msg: ServerMsg, view: &Drawing) -> Result<Received> {
         match msg {
-            ServerMsg::Accepted { seq, client, batch, changes } => {
+            ServerMsg::Accepted { seq, client, batch, base, changes } => {
                 apply(&mut self.confirmed, &changes)?;
+                self.note_renames(&changes);
+                self.note_concurrent(seq, client, base, &changes);
                 self.seq = seq;
                 if client == self.id {
                     match self.pending.pop_front() {
@@ -111,6 +186,10 @@ impl Client {
             ServerMsg::Peers { peers } => {
                 self.others.retain(|c, _| peers.iter().any(|p| p.client == *c));
                 self.peers = peers;
+                Ok(Received::default())
+            }
+            ServerMsg::Locks { locks } => {
+                self.locks = locks.into_iter().collect();
                 Ok(Received::default())
             }
             ServerMsg::Presence { client, presence } => {

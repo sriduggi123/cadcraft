@@ -101,7 +101,7 @@ fn every_command_syncs_on_a_blank_drawing() {
         seen.extend(run(seed, Drawing::default(), 80));
     }
     // The commands must keep reaching every kind of change, or this test checks little.
-    for k in ["delete", "block", "create", "common", "geometry", "order", "var", "doc"] {
+    for k in ["delete", "block", "create", "common", "geometry", "order", "var", "entry"] {
         assert!(seen.contains(k), "no `{k}` change in any run: {seen:?}");
     }
 }

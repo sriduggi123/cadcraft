@@ -25,6 +25,9 @@ pub enum Change {
     Order { container: Container, ids: Vec<Handle> },
     /// A shared drawing variable; `None` removes it.
     Var { name: String, value: Option<Json> },
-    /// A drawing-level field written whole (layers, styles, layouts…).
+    /// A drawing-level field written whole (layouts, and tables that can't go entry by entry).
     Doc { field: String, value: Json },
+    /// One named entry of a drawing-level table (a layer, a text style…): `value` replaces the
+    /// entry called `name` in place, under its own name (a rename), or is added; `None` removes it.
+    Entry { field: String, name: String, value: Option<Json> },
 }

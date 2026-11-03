@@ -35,7 +35,7 @@ pub mod space;
 pub mod undo;
 pub mod vars;
 
-pub use apply::apply;
+pub use apply::{apply, apply_lenient};
 pub use cadcraft_doc::{Drawing, Handle};
 pub use change::Change;
 pub use container::Container;

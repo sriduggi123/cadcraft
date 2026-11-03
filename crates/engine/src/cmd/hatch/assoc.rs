@@ -246,3 +246,44 @@ pub fn update(after: &mut Arc<Drawing>, before: &Drawing) -> Vec<String> {
     }
     notes
 }
+
+/// Repair after two people edited at once: an associative hatch that `suspect` names (one person
+/// changed it while another changed its boundary objects) is filled again from its objects when
+/// its loops no longer match them. Returns the number of hatches repaired.
+pub fn repair(after: &mut Arc<Drawing>, suspect: impl Fn(Handle, &[Handle]) -> bool) -> usize {
+    let mut changes: Vec<(Handle, Hatch)> = Vec::new();
+    {
+        let d: &Drawing = after;
+        for store in std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)) {
+            for e in store.iter() {
+                let EntityKind::Hatch(h) = &e.kind else { continue };
+                if !h.associative || changes.len() >= MAX_NEW_CHECKED {
+                    continue;
+                }
+                let sources: Vec<Handle> = h.loops.iter().flat_map(|l| l.sources.iter().copied()).take(MAX_SOURCES).collect();
+                if !suspect(e.handle, &sources) {
+                    continue;
+                }
+                let mut nh = h.clone();
+                for l in nh.loops.iter_mut().filter(|l| !l.sources.is_empty()) {
+                    if let Refill::Loop(vs) = refill(d, d, l)
+                        && !same_shape(&vs, &l.vertices)
+                    {
+                        l.vertices = vs;
+                    }
+                }
+                if nh != *h {
+                    changes.push((e.handle, nh));
+                }
+            }
+        }
+    }
+    let n = changes.len();
+    if n > 0 {
+        let d = Arc::make_mut(after);
+        for (h, nh) in changes {
+            let _ = d.modify_entity(h, |e| e.kind = EntityKind::Hatch(nh));
+        }
+    }
+    n
+}

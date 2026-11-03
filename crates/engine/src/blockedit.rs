@@ -60,6 +60,9 @@ pub struct BlockEdit {
     base: Vec2,
     /// The editor is open on the drawing itself ([`CURRENT_DRAWING`]).
     pub current: bool,
+    /// The drawing behind the editor as it was when the editor opened or last saved. In a shared
+    /// drawing others' edits still arrive in `host`; a save keeps them (see [`keep_others`]).
+    opened: Arc<Drawing>,
 }
 
 /// Why a block can't be opened in the Block Editor, if it can't.
@@ -237,10 +240,11 @@ impl DocState {
             self.enter_block_editor(BlockEdit {
                 name: CURRENT_DRAWING.into(),
                 host,
-                saved: editor,
+                saved: editor.clone(),
                 original: EntityStore::new(),
                 base: Vec2::ZERO,
                 current: true,
+                opened: editor,
             });
             return Ok(());
         }
@@ -261,9 +265,18 @@ impl DocState {
         d.constraints.clear();
         d.hidden_objects.clear();
         let host = Box::new(self.clone());
+        let opened = self.doc.clone();
         let editor = Arc::new(d);
         self.doc = editor.clone();
-        self.enter_block_editor(BlockEdit { name: block.name.clone(), host, saved: editor, original: block.entities.clone(), base, current: false });
+        self.enter_block_editor(BlockEdit {
+            name: block.name.clone(),
+            host,
+            saved: editor,
+            original: block.entities.clone(),
+            base,
+            current: false,
+            opened,
+        });
         Ok(())
     }
 
@@ -290,7 +303,8 @@ impl DocState {
     pub fn save_block_editor(&mut self, as_name: Option<&str>) -> Result<()> {
         let Some(be) = &self.block_edit else { return Err(EngineError::Other("The Block Editor is not open.".into())) };
         let name = as_name.unwrap_or(&be.name).to_string();
-        let d = be.compose(&self.doc, &name)?;
+        let mut d = be.compose(&self.doc, &name)?;
+        keep_others(&mut d, &be.opened, &be.host.doc, &be.name);
         let original = d.block(&name).map(|b| b.entities.clone()).unwrap_or_default();
         let name = d.block(&name).map(|b| b.name.clone()).unwrap_or(name);
         // When BSAVEAS saves the block under another name, the editor's drawing and each undo and
@@ -315,9 +329,11 @@ impl DocState {
         let Some(be) = &mut self.block_edit else { return Ok(()) };
         let before = be.host.doc.clone();
         let selection = be.host.selection.clone();
-        be.host.push_undo(Snapshot::new(UNDO_LABEL, before, selection));
         be.host.doc = Arc::new(d);
+        // Recorded once the block is saved: the step is the drawing before and after.
+        be.host.push_undo(Snapshot::new(UNDO_LABEL, before, selection));
         be.host.revision += 1;
+        be.opened = be.host.doc.clone();
         be.original = original;
         be.saved = editor;
         be.name = name;
@@ -351,4 +367,27 @@ impl DocState {
         self.revision += 1;
         Ok(())
     }
+}
+
+/// What others changed in the drawing behind the editor since it opened (`opened` → `host`, a
+/// shared drawing only), put back into `d`, the drawing a save makes from the editor's copy:
+/// otherwise the save would take back their table, style and block changes. The edited block
+/// is the editor's (it is locked); model and paper space already come from `host`.
+fn keep_others(d: &mut Drawing, opened: &Arc<Drawing>, host: &Arc<Drawing>, edited: &str) {
+    if Arc::ptr_eq(opened, host) {
+        return;
+    }
+    let Ok(changes) = cadcraft_collab::diff(opened, host) else { return };
+    let ours = |c: &cadcraft_collab::Container| matches!(c, cadcraft_collab::Container::Block { name } if name.eq_ignore_ascii_case(edited));
+    let theirs: Vec<_> = changes
+        .into_iter()
+        .filter(|c| match c {
+            cadcraft_collab::Change::Block { name, .. } => !name.eq_ignore_ascii_case(edited),
+            cadcraft_collab::Change::Create { container, .. } | cadcraft_collab::Change::Order { container, .. } => {
+                matches!(container, cadcraft_collab::Container::Block { .. }) && !ours(container)
+            }
+            _ => true,
+        })
+        .collect();
+    cadcraft_collab::apply_lenient(d, &theirs);
 }

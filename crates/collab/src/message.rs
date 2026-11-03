@@ -16,12 +16,16 @@ pub enum ClientMsg {
     /// drawing to start it with (a [`crate::snapshot`]); ignored once the session has one.
     /// `create`: this must be a new file; the server refuses if the name is taken.
     Hello { name: String, seed: Option<Vec<u8>>, create: bool },
-    /// One command's changes. `batch` numbers the client's batches, so replies can name them.
-    Batch { batch: u64, changes: Vec<Change> },
+    /// One command's changes. `batch` numbers the client's batches, so replies can name them;
+    /// `base` is the last batch the server had confirmed to this client when it made them, so
+    /// everyone can tell which batches were made at the same time.
+    Batch { batch: u64, base: u64, changes: Vec<Change> },
     /// On the server's file list (`/files`): ask for the list.
     List,
     /// Where this person is and what they're doing; the server passes it on to the others.
     Presence(Presence),
+    /// Lock block `block` while this person edits it in the Block Editor (`on`), or let it go.
+    Lock { block: String, on: bool },
 }
 
 /// Most selected objects a presence message carries.
@@ -69,7 +73,7 @@ pub enum ServerMsg {
     /// The reply to `Hello`: the client's id (its handle space) and the drawing as of `seq`.
     Welcome { client: u32, seq: u64, snapshot: Vec<u8> },
     /// A batch the server accepted, numbered `seq`, sent to everyone (its author included).
-    Accepted { seq: u64, client: u32, batch: u64, changes: Vec<Change> },
+    Accepted { seq: u64, client: u32, batch: u64, base: u64, changes: Vec<Change> },
     /// A batch the server refused, sent to its author only; nobody else ever sees it.
     Rejected { batch: u64, reason: String },
     /// Who is in the session, after someone joins or leaves.
@@ -80,6 +84,8 @@ pub enum ServerMsg {
     Files { files: Vec<FileInfo> },
     /// Someone else's [`Presence`].
     Presence { client: u32, presence: Presence },
+    /// The blocks locked now, with who holds each, after any lock changes.
+    Locks { locks: Vec<(String, u32)> },
 }
 
 /// Encode a message for the wire.

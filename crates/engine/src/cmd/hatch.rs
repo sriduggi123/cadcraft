@@ -19,6 +19,7 @@ pub(crate) use assoc::detach;
 mod edit;
 mod pick;
 use super::has_doc;
+pub(crate) use assoc::repair as repair_associative;
 pub(crate) use assoc::update as refill_associative;
 pub use pick::{HatchPicks, PickMode};
 

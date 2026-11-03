@@ -18,6 +18,7 @@ enum Key {
     Block(String),
     Var(String),
     Doc(String),
+    Entry(String, String),
 }
 
 fn key(c: &Change) -> Key {
@@ -29,6 +30,7 @@ fn key(c: &Change) -> Key {
         Change::Block { name, .. } => Key::Block(name.clone()),
         Change::Var { name, .. } => Key::Var(name.clone()),
         Change::Doc { field, .. } => Key::Doc(field.clone()),
+        Change::Entry { field, name, .. } => Key::Entry(field.clone(), name.clone()),
     }
 }
 

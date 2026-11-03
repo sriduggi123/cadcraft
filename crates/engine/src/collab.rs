@@ -5,8 +5,8 @@
 //! a command never sees the drawing change under it.
 //!
 //! Undo in a session takes back only this person's steps ([`DocState::revert_in`]): swapping the
-//! drawing back would take back other people's edits too. The Block Editor and REFEDIT, which
-//! swap the whole drawing, are refused (P5).
+//! drawing back would take back other people's edits too. The Block Editor locks its block on
+//! the server while open; REFEDIT, which edits a block in place in the drawing, is refused.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ pub use cadcraft_collab::Link;
 use cadcraft_collab::client::Client;
 use cadcraft_collab::message::{ClientMsg, MAX_SELECTION, Peer, Presence, ServerMsg};
 use cadcraft_collab::snapshot;
-use cadcraft_doc::{Drawing, Space};
+use cadcraft_doc::{Drawing, Handle, Space};
 use cadcraft_geom::Vec2;
 
 use crate::view::View;
@@ -27,7 +27,7 @@ const MAX_PER_TICK: usize = 256;
 const PRESENCE_EVERY: f64 = 0.05;
 
 /// Commands that can't run in a shared session yet.
-const REFUSED: &[&str] = &["bedit", "refedit"];
+const REFUSED: &[&str] = &["refedit"];
 
 /// The live session of one drawing.
 pub struct Live {
@@ -46,6 +46,12 @@ pub struct Live {
     /// The person whose view this one follows, and the view last copied from them.
     following: Option<u32>,
     followed: Option<View>,
+    /// The shared drawing as last sent or received: the next batch is what changed since. While
+    /// the Block Editor is open it is the drawing waiting behind the editor, which changes only
+    /// when the block is saved.
+    known: Option<Arc<Drawing>>,
+    /// The block this person has locked for the Block Editor.
+    locked: Option<String>,
 }
 
 impl Session {
@@ -66,8 +72,19 @@ impl Session {
         let uid = st.uid;
         let mut link = link;
         link.send(&ClientMsg::Hello { name: name.to_string(), seed, create }).map_err(|e| EngineError::Other(e.to_string()))?;
-        self.collab =
-            Some(Live { link, uid, client: None, ended: None, url: url.to_string(), sent: None, sent_at: 0.0, following: None, followed: None });
+        self.collab = Some(Live {
+            link,
+            uid,
+            client: None,
+            ended: None,
+            url: url.to_string(),
+            sent: None,
+            sent_at: 0.0,
+            following: None,
+            followed: None,
+            known: None,
+            locked: None,
+        });
         Ok(())
     }
 
@@ -130,11 +147,59 @@ impl Session {
         if self.running.is_some() || self.lisp_busy() {
             return;
         }
+        self.collab_sync_lock();
         self.collab_drain();
         self.collab_follow_step();
     }
 
     fn collab_drain(&mut self) {
+        let start = self.collab.as_ref().and_then(|l| self.docs.iter().find(|d| d.uid == l.uid)).map(|d| d.doc.clone());
+        self.collab_drain_messages();
+        if let Some(start) = start {
+            self.collab_repair(&start);
+        }
+    }
+
+    /// Repair derived data after others' edits arrived (`start` is the drawing before they did):
+    /// associative dimensions and hatches whose objects someone changed while another changed
+    /// them, when they no longer agree, and objects on a layer that is gone (renamed meanwhile:
+    /// they follow the rename; else the layer is made again). One person does it, the one with
+    /// the lowest client id, and the fix goes out as an edit.
+    fn collab_repair(&mut self, start: &Arc<Drawing>) {
+        let pairs = self.collab.as_mut().and_then(|l| l.client.as_mut()).map(Client::take_concurrent).unwrap_or_default();
+        let suspect = |own: Handle, sources: &[Handle]| {
+            pairs.iter().any(|(a, b)| {
+                (a.contains(&own) && sources.iter().any(|s| b.contains(s))) || (b.contains(&own) && sources.iter().any(|s| a.contains(s)))
+            })
+        };
+        let Some(live) = self.collab.as_ref().filter(|l| l.ended.is_none()) else { return };
+        let Some(client) = live.client.as_ref() else { return };
+        if client.peers().iter().map(|p| p.client).min().is_some_and(|m| m != client.id()) {
+            return;
+        }
+        let uid = live.uid;
+        let Some(st) = self.docs.iter().find(|d| d.uid == uid) else { return };
+        if Arc::ptr_eq(start, &st.doc) || st.block_edit.is_some() {
+            return;
+        }
+        let pre = st.doc.clone();
+        let mut d = pre.clone();
+        let mut fixed = if pairs.is_empty() { 0 } else { crate::assoc::repair(&mut d, suspect) };
+        if !pairs.is_empty() {
+            fixed += crate::cmd::hatch::repair_associative(&mut d, suspect);
+        }
+        fixed += repair_layers(&mut d, start, |name| client.renamed("layers", name).map(str::to_string));
+        if fixed == 0 || Arc::ptr_eq(&d, &pre) {
+            return;
+        }
+        if let Some(st) = self.docs.iter_mut().find(|x| x.uid == uid) {
+            st.doc = d;
+            st.revision += 1;
+        }
+        self.collab_after_edit(&pre, uid, "repair");
+    }
+
+    fn collab_drain_messages(&mut self) {
         for _ in 0..MAX_PER_TICK {
             let Some(live) = self.collab.as_mut().filter(|l| l.ended.is_none()) else { return };
             let msg = match live.link.recv() {
@@ -157,7 +222,7 @@ impl Session {
         let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none()) else { return };
         let uid = live.uid;
         let mut p = Presence::default();
-        if let Some(st) = self.docs.get(self.active).filter(|d| d.uid == uid) {
+        if let Some(st) = self.docs.get(self.active).filter(|d| d.uid == uid && d.block_edit.is_none()) {
             p.layout = layout_name(&st.space);
             p.cursor = cursor.filter(|c| c.is_finite()).map(|c| [c.x, c.y]);
             p.selection = st.selection.iter().take(MAX_SELECTION).copied().collect();
@@ -226,6 +291,45 @@ impl Session {
         }
     }
 
+    /// Lock the block open in the shared drawing's Block Editor, or let go of it once closed. A
+    /// block someone else holds closes the editor again, unchanged.
+    fn collab_sync_lock(&mut self) {
+        let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none()) else { return };
+        let uid = live.uid;
+        let open = self.docs.iter().find(|d| d.uid == uid).and_then(|d| d.block_editor()).map(str::to_string);
+        if open.as_deref().map(str::to_lowercase) == live.locked.as_deref().map(str::to_lowercase) {
+            return;
+        }
+        let holder = |name: &str| {
+            live.client.as_ref().and_then(|c| {
+                c.lock_holder(name).filter(|h| *h != c.id()).map(|h| (h, c.peers().iter().find(|p| p.client == h).map(|p| p.name.clone())))
+            })
+        };
+        if let Some(name) = &open
+            && let Some((_, who)) = holder(name)
+        {
+            if let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid) {
+                let _ = st.close_block_editor(false);
+            }
+            let who = who.unwrap_or_else(|| "someone else".into());
+            return self.echo(format!("Block {name} is being edited by {who}; try again when they close it."));
+        }
+        let Some(live) = self.collab.as_mut() else { return };
+        let mut msgs = Vec::new();
+        if let Some(old) = live.locked.take() {
+            msgs.push(ClientMsg::Lock { block: old, on: false });
+        }
+        if let Some(new) = open {
+            msgs.push(ClientMsg::Lock { block: new.clone(), on: true });
+            live.locked = Some(new);
+        }
+        for m in msgs {
+            if let Err(e) = live.link.send(&m) {
+                return self.collab_end(format!("the connection to the server failed: {e}"));
+            }
+        }
+    }
+
     fn collab_end(&mut self, why: String) {
         self.echo(format!("Shared session ended: {why}"));
         if let Some(l) = self.collab.as_mut() {
@@ -250,14 +354,18 @@ impl Session {
             }
             (None, ServerMsg::Error { message }) => return Err(message),
             (None, _) => None,
-            (Some(c), msg) => c.receive(msg, &st.doc).map_err(|e| e.to_string())?.view,
+            (Some(c), msg) => c.receive(msg, st.drawing()).map_err(|e| e.to_string())?.view,
         };
         let notices = live.client.as_mut().map(Client::take_notices).unwrap_or_default();
         if let Some(view) = view {
-            st.doc = Arc::new(view);
-            let doc = st.doc.clone();
-            st.selection.retain(|h| doc.entity(*h).is_some());
+            // With the Block Editor open, others' edits go to the drawing behind it.
+            let view = Arc::new(view);
+            *st.drawing_arc_mut() = view.clone();
+            if st.block_edit.is_none() {
+                st.selection.retain(|h| view.entity(*h).is_some());
+            }
             st.revision += 1;
+            live.known = Some(view);
         }
         notices.into_iter().for_each(|n| self.echo(n));
         Ok(())
@@ -268,13 +376,16 @@ impl Session {
         if id.starts_with("collab.") {
             return;
         }
+        self.collab_sync_lock();
+        let Some(after) = self.docs.iter().find(|d| d.uid == uid).map(|d| d.drawing().clone()) else { return };
         let Some(live) = self.collab.as_mut().filter(|l| l.uid == uid && l.ended.is_none()) else { return };
         let Some(client) = live.client.as_mut() else { return };
-        let Some(after) = self.docs.iter().find(|d| d.uid == uid).map(|d| d.doc.clone()) else { return };
-        if Arc::ptr_eq(before, &after) {
+        let before = live.known.clone().unwrap_or_else(|| before.clone());
+        if Arc::ptr_eq(&before, &after) {
             return;
         }
-        let sent = match client.local(before, &after) {
+        live.known = Some(after.clone());
+        let sent = match client.local(&before, &after) {
             Ok(Some(msg)) => live.link.send(&msg),
             Ok(None) => Ok(()),
             Err(e) => Err(e),
@@ -324,4 +435,35 @@ impl crate::DocState {
         back.parts.push((now, new));
         Ok((back, left))
     }
+}
+
+/// Objects that edits since `before` left on a layer that doesn't exist (someone renamed or
+/// deleted it while another drew on it): onto the layer's new name when it was renamed, else
+/// the layer is made again with default settings. Returns how many objects or layers changed.
+fn repair_layers(d: &mut Arc<Drawing>, before: &Drawing, renamed: impl Fn(&str) -> Option<String>) -> usize {
+    let mut moves: Vec<(Handle, String)> = Vec::new();
+    let mut make: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for store in std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)) {
+        for e in store.iter() {
+            let touched = before.entity(e.handle).is_none_or(|x| !Arc::ptr_eq(x, e));
+            if !touched || d.layer(&e.common.layer).is_some() {
+                continue;
+            }
+            match renamed(&e.common.layer).filter(|n| d.layer(n).is_some()) {
+                Some(to) => moves.push((e.handle, to)),
+                None => {
+                    make.insert(e.common.layer.clone());
+                }
+            }
+        }
+    }
+    let n = moves.len() + make.len();
+    if n > 0 {
+        let d = Arc::make_mut(d);
+        for (h, to) in moves {
+            let _ = d.modify_entity(h, |e| e.common.layer = to);
+        }
+        d.layers.extend(make.iter().map(|name| cadcraft_doc::Layer::new(name)));
+    }
+    n
 }
