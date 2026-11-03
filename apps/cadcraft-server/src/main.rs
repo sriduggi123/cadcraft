@@ -10,6 +10,14 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:9010")]
     listen: String,
+    /// The built web app (`trunk build --release` in apps/cadcraft-web writes `dist/web`): then
+    /// `http://ADDRESS/s/<session>` opens CADCraft in a browser, joined to that session.
+    #[arg(long)]
+    web: Option<std::path::PathBuf>,
+    /// Folder for the sessions' drawings: saved as they change and reopened after a restart.
+    /// Without it, a session ends when its last person leaves.
+    #[arg(long)]
+    data: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -22,7 +30,8 @@ fn main() {
         }
     };
     eprintln!("cadcraft-server: listening on ws://{}/s/<session>", args.listen);
-    if let Err(e) = cadcraft_server::serve(listener, cadcraft_server::Rooms::default()) {
+    let rooms = cadcraft_server::Rooms::new(cadcraft_server::Config { web: args.web, data: args.data });
+    if let Err(e) = cadcraft_server::serve(listener, rooms) {
         eprintln!("cadcraft-server: {e}");
         std::process::exit(1);
     }

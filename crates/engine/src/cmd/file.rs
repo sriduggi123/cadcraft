@@ -107,6 +107,14 @@ pub fn write_as() -> Option<WriteAsHook> {
     WRITE_AS.get().copied()
 }
 
+static WRITE_SHARED: OnceLock<WriteAsHook> = OnceLock::new();
+
+/// Install the writer for a drawing saved from a shared session (`cadcraft_io::write_shared`:
+/// handles renumbered from 1, since session handles don't fit DWG's 32 bits).
+pub fn set_write_shared(h: WriteAsHook) {
+    let _ = WRITE_SHARED.set(h);
+}
+
 /// The versions a drawing can be saved in, for messages ("2000, 2004, …, 2018").
 fn version_list() -> String {
     Version::ALL.iter().map(|v| v.year()).collect::<Vec<_>>().join(", ")
@@ -156,7 +164,10 @@ fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<
     let d: &cadcraft_doc::Drawing = if is_drawing_file(path) { s.state()?.drawing() } else { s.doc()? };
     let copy = (opts.portable_fonts && is_drawing_file(path)).then(|| Drawing { portable_fonts: true, ..d.clone() });
     let d = copy.as_ref().unwrap_or(d);
-    let r = if opts.version.is_none() && !opts.binary {
+    let shared = if is_drawing_file(path) && s.collab_live() { WRITE_SHARED.get().copied() } else { None };
+    let r = if let Some(w) = shared {
+        w(d, path, opts)
+    } else if opts.version.is_none() && !opts.binary {
         (hooks.write)(d, path)
     } else {
         let w = write_as().ok_or_else(|| bad(cmd, "saving at a chosen version or as binary DXF is not available in this build"))?;

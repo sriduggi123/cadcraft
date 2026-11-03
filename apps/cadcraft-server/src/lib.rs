@@ -1,21 +1,28 @@
 //! The CADCraft session server: shared drawing sessions over WebSockets. A client connects to
 //! `/s/<session>`; the first to join a session brings its drawing, later ones receive it. Each
-//! session's [`Server`] state machine orders the batches; this crate only moves bytes.
+//! session's [`Server`] state machine orders the batches; this crate moves bytes, serves the web
+//! app and DWG/DXF downloads on the same port (`http.rs`), and keeps sessions on disk.
 //!
-//! P1 scope: sessions live in memory and end when the last person leaves; no accounts, no TLS
-//! (run it behind a TLS-terminating proxy for `wss://`). The journal, persistence and accounts
-//! are P2 and P6 of `plan/multiplayer-design.md`.
+//! With a data folder, each session's drawing is written there ([`SAVE_EVERY`] at most, and when
+//! the last person leaves) and a session reopens from it. No accounts and no TLS yet (run it
+//! behind a TLS-terminating proxy for `wss://`); accounts are P6 of `plan/multiplayer-design.md`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod http;
+
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use cadcraft_collab::message::{self, ClientMsg, MAX_MESSAGE_BYTES, ServerMsg};
 use cadcraft_collab::server::{Outgoing, Server, To};
+use cadcraft_collab::snapshot;
+use cadcraft_doc::Drawing;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::http::StatusCode;
 use tungstenite::protocol::WebSocketConfig;
@@ -25,20 +32,38 @@ use tungstenite::{Message, WebSocket};
 pub const MAX_SESSIONS: usize = 1000;
 /// Most people in one session.
 pub const MAX_PEOPLE: usize = 64;
+/// How often changed sessions are written to the data folder.
+pub const SAVE_EVERY: Duration = Duration::from_secs(2);
 /// How long a read waits before the connection's thread sends what is queued.
 const POLL: Duration = Duration::from_millis(15);
 
 struct Room {
     server: Server,
     conns: HashMap<u32, Sender<Vec<u8>>>,
+    /// The server's `seq` last written to disk (`None`: not written yet).
+    saved: Option<u64>,
+}
+
+/// Where the server keeps things: the built web app (`dist/web`) and the sessions' drawings.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    pub web: Option<PathBuf>,
+    pub data: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
-pub struct Rooms(Arc<Mutex<HashMap<String, Room>>>);
+pub struct Rooms {
+    rooms: Arc<Mutex<HashMap<String, Room>>>,
+    config: Arc<Config>,
+}
 
 impl Rooms {
+    pub fn new(config: Config) -> Rooms {
+        Rooms { rooms: Arc::default(), config: Arc::new(config) }
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Room>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.rooms.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// How many sessions are open and how many people are in them.
@@ -46,10 +71,78 @@ impl Rooms {
         let rooms = self.lock();
         (rooms.len(), rooms.values().map(|r| r.conns.len()).sum())
     }
+
+    /// The session's file in the data folder.
+    fn file(&self, name: &str) -> Option<PathBuf> {
+        self.config.data.as_ref().map(|d| d.join(format!("{name}.cadsession")))
+    }
+
+    /// The drawing saved for session `name`, if there is one. An unreadable file is an error, so
+    /// a new session never replaces it.
+    fn load(&self, name: &str) -> Result<Option<Drawing>, String> {
+        let Some(path) = self.file(name).filter(|p| p.exists()) else { return Ok(None) };
+        let bytes = std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        snapshot::decode(&bytes).map(Some).map_err(|e| format!("the saved session {name} could not be read: {e}"))
+    }
+
+    /// The session's drawing now: live, or as last saved.
+    pub fn drawing(&self, name: &str) -> Result<Option<Drawing>, String> {
+        if let Some(d) = self.lock().get(name).and_then(|r| r.server.drawing().cloned()) {
+            return Ok(Some(d));
+        }
+        self.load(name)
+    }
+
+    /// Write every session changed since its last save.
+    pub fn save_changed(&self) {
+        let changed: Vec<(String, u64, Drawing)> = {
+            let rooms = self.lock();
+            rooms
+                .iter()
+                .filter(|(_, r)| r.saved != Some(r.server.seq()))
+                .filter_map(|(n, r)| Some((n.clone(), r.server.seq(), r.server.drawing()?.clone())))
+                .collect()
+        };
+        for (name, seq, d) in changed {
+            if self.save(&name, &d)
+                && let Some(r) = self.lock().get_mut(&name)
+            {
+                r.saved = Some(seq);
+            }
+        }
+    }
+
+    /// Write `d` as session `name`'s file (through a temporary file, so a crash never leaves half
+    /// a file). Whether it was written.
+    fn save(&self, name: &str, d: &Drawing) -> bool {
+        let Some(path) = self.file(name) else { return false };
+        let result = snapshot::encode(d).map_err(|e| e.to_string()).and_then(|bytes| write_replacing(&path, &bytes).map_err(|e| e.to_string()));
+        if let Err(e) = &result {
+            eprintln!("session {name}: not saved: {e}");
+        }
+        result.is_ok()
+    }
 }
 
-/// Accept connections on `listener` until it fails, one thread each.
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("cadsession.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Accept connections on `listener` until it fails, one thread each; with a data folder, a
+/// thread saves changed sessions every [`SAVE_EVERY`].
 pub fn serve(listener: TcpListener, rooms: Rooms) -> std::io::Result<()> {
+    if let Some(dir) = &rooms.config.data {
+        std::fs::create_dir_all(dir)?;
+        let saver = rooms.clone();
+        std::thread::Builder::new().name("collab-save".into()).spawn(move || {
+            loop {
+                std::thread::sleep(SAVE_EVERY);
+                saver.save_changed();
+            }
+        })?;
+    }
     for stream in listener.incoming() {
         let stream = stream?;
         let rooms = rooms.clone();
@@ -69,6 +162,36 @@ pub fn session_name(path: &str) -> Option<String> {
     ok.then(|| name.to_string())
 }
 
+/// The connection's stream with the request head, already read to tell a WebSocket from a page
+/// request, put back in front.
+struct Replay {
+    head: Vec<u8>,
+    pos: usize,
+    inner: TcpStream,
+}
+
+impl Read for Replay {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rest = self.head.get(self.pos..).unwrap_or_default();
+        if rest.is_empty() {
+            return self.inner.read(buf);
+        }
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Write for Replay {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn not_found() -> ErrorResponse {
     let mut r = ErrorResponse::new(Some("connect to /s/<session>".into()));
     *r.status_mut() = StatusCode::NOT_FOUND;
@@ -77,7 +200,11 @@ fn not_found() -> ErrorResponse {
 
 // The handshake callback's error type is tungstenite's HTTP response, large by its design.
 #[allow(clippy::result_large_err)]
-fn connection(stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
+fn connection(mut stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
+    let head = http::read_head(&mut stream).map_err(|e| e.to_string())?;
+    if !http::is_websocket(&head) {
+        return http::respond(&mut stream, &head, rooms).map_err(|e| e.to_string());
+    }
     let mut name = None;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES)).max_frame_size(Some(MAX_MESSAGE_BYTES));
     let callback = |req: &Request, resp: Response| match session_name(req.uri().path()) {
@@ -87,9 +214,10 @@ fn connection(stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
         }
         None => Err(not_found()),
     };
-    let mut ws = tungstenite::accept_hdr_with_config(stream, callback, Some(config)).map_err(|e| e.to_string())?;
+    let replay = Replay { head, pos: 0, inner: stream };
+    let mut ws = tungstenite::accept_hdr_with_config(replay, callback, Some(config)).map_err(|e| e.to_string())?;
     let name = name.ok_or("no session name")?;
-    ws.get_mut().set_read_timeout(Some(POLL)).map_err(|e| e.to_string())?;
+    ws.get_mut().inner.set_read_timeout(Some(POLL)).map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
     let mut client = None;
     let result = pump(&mut ws, &rx, |msg| handle(rooms, &name, &mut client, &tx, msg));
@@ -100,7 +228,12 @@ fn connection(stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
             let out = room.server.leave(id);
             route(room, out);
             if room.conns.is_empty() {
+                let last = room.server.drawing().filter(|_| room.saved != Some(room.server.seq())).cloned();
                 all.remove(&name);
+                drop(all);
+                if let Some(d) = last {
+                    rooms.save(&name, &d);
+                }
                 eprintln!("session {name} closed");
             }
         }
@@ -109,7 +242,7 @@ fn connection(stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
 }
 
 /// Move messages until the client closes or breaks the protocol.
-fn pump(ws: &mut WebSocket<TcpStream>, rx: &Receiver<Vec<u8>>, mut on: impl FnMut(ClientMsg) -> Result<(), String>) -> Result<(), String> {
+fn pump(ws: &mut WebSocket<Replay>, rx: &Receiver<Vec<u8>>, mut on: impl FnMut(ClientMsg) -> Result<(), String>) -> Result<(), String> {
     loop {
         loop {
             match rx.try_recv() {
@@ -132,13 +265,25 @@ fn pump(ws: &mut WebSocket<TcpStream>, rx: &Receiver<Vec<u8>>, mut on: impl FnMu
 }
 
 fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u8>>, msg: ClientMsg) -> Result<(), String> {
-    let mut all = rooms.lock();
     match (msg, *client) {
         (ClientMsg::Hello { name: who, seed }, None) => {
+            // Read a saved session before taking the lock; it is used only if the room is new.
+            let saved = if rooms.lock().contains_key(name) {
+                None
+            } else {
+                match rooms.load(name) {
+                    Ok(d) => d,
+                    Err(e) => return refuse(tx, &e),
+                }
+            };
+            let mut all = rooms.lock();
             if !all.contains_key(name) && all.len() >= MAX_SESSIONS {
                 return refuse(tx, "the server is full");
             }
-            let room = all.entry(name.to_string()).or_insert_with(|| Room { server: Server::new(None), conns: HashMap::new() });
+            let room = all.entry(name.to_string()).or_insert_with(|| {
+                let saved_seq = saved.is_some().then_some(0);
+                Room { server: Server::new(saved), conns: HashMap::new(), saved: saved_seq }
+            });
             if room.conns.len() >= MAX_PEOPLE {
                 return refuse(tx, "the session is full");
             }
@@ -153,6 +298,7 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
             Ok(())
         }
         (ClientMsg::Batch { batch, changes }, Some(id)) => {
+            let mut all = rooms.lock();
             let room = all.get_mut(name).ok_or("the session is gone")?;
             let out = room.server.batch(id, batch, changes);
             route(room, out);

@@ -1,6 +1,7 @@
 //! Shared-session commands (the fork's multiplayer work): join a session server, leave it, and
 //! list who is in it. Ordinary commands, so the CLI, the control channel and MCP can join too.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -9,6 +10,7 @@ use super::{bad, str_param};
 use crate::{CommandSpec, EngineError, Result, Session};
 
 /// How long `collab.join` waits for the server's welcome.
+#[cfg(not(target_arch = "wasm32"))]
 const JOIN_WAIT: Duration = Duration::from_secs(20);
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -32,6 +34,19 @@ fn run_join(s: &mut Session, p: &Value) -> Result<Value> {
     let host = p.get("host").and_then(Value::as_bool).unwrap_or(false);
     let link = cadcraft_collab_net::connect(url).map_err(|e| EngineError::Other(e.to_string()))?;
     s.collab_attach(link, name, host)?;
+    wait_for_welcome(s)?;
+    run_peers(s, &json!({}))
+}
+
+/// Natively, wait for the welcome. The browser can't block: the welcome arrives through a later
+/// frame's `collab_tick`, and `joined` is false until then.
+#[cfg(target_arch = "wasm32")]
+fn wait_for_welcome(_: &mut Session) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_for_welcome(s: &mut Session) -> Result<()> {
     let start = Instant::now();
     while !s.collab_joined() {
         s.collab_tick();
@@ -44,7 +59,7 @@ fn run_join(s: &mut Session, p: &Value) -> Result<Value> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    run_peers(s, &json!({}))
+    Ok(())
 }
 
 fn run_leave(s: &mut Session, _: &Value) -> Result<Value> {

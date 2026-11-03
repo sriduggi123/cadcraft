@@ -104,6 +104,16 @@ mod web {
         web_sys::UrlSearchParams::new_with_str(&query()).ok()?.get(key)
     }
 
+    /// The session's WebSocket address when the page was served by a session server at
+    /// `/s/<name>` (same host; `wss://` under `https://`).
+    fn web_session_url() -> Option<String> {
+        let loc = web_sys::window()?.location();
+        let path = loc.pathname().ok()?;
+        let name = crate::session_from_path(&path)?;
+        let scheme = if loc.protocol().ok()? == "https:" { "wss" } else { "ws" };
+        Some(format!("{scheme}://{}/s/{name}", loc.host().ok()?))
+    }
+
     /// No file picker on the web: Save / Save As from the menu (and the close prompt) download the
     /// drawing under its current name; `saveas {"path": "name.dxf"}` picks another name. There is
     /// no file system either, so a dropped file is opened from its contents and APPLOAD says to
@@ -121,6 +131,10 @@ mod web {
         });
         cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
             cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
+        });
+        // A drawing saved from a shared session gets handles that fit DWG (multiplayer fork).
+        cadcraft_engine::cmd::file::set_write_shared(|d, name, o| {
+            cadcraft_io::write_shared(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
         });
         // AutoLISP's entget, entmake and entmod see entities as DXF groups.
         cadcraft_engine::cmd::file::set_entity_codec(cadcraft_engine::cmd::file::EntityCodec {
@@ -183,6 +197,13 @@ mod web {
                         if query().contains("sample") {
                             let _ = app.run("ui.sample", serde_json::json!({}));
                         }
+                        // Opened from a session server at `/s/<name>`: join that session there.
+                        if let Some(url) = web_session_url() {
+                            let name = query_param("name").unwrap_or_else(|| "Web user".into());
+                            if let Err(e) = app.run("collab.join", serde_json::json!({"url": url, "name": name, "host": true})) {
+                                log::error!("could not join {url}: {e}");
+                            }
+                        }
                         // No paths on the web: OPEN asks the browser's file picker, which reads the
                         // chosen file in the background (`upload.rs`), so the picker returns none.
                         let inbox = crate::upload::Inbox::new(&cc.egui_ctx);
@@ -214,6 +235,15 @@ mod web {
             }
         });
     }
+}
+
+/// The session name in a page path `/s/<name>` (letters, digits, `-`, `_`; a trailing `/` is
+/// allowed), as the session server serves the app.
+#[cfg(any(target_arch = "wasm32", test))]
+fn session_from_path(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("/s/")?.trim_end_matches('/');
+    let ok = !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then_some(name)
 }
 
 /// True when the URL query (`?cpu&sample`) has a `cpu` flag: the CPU canvas path is requested.
@@ -275,7 +305,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{document_title, push_title, title_to_send, wants_cpu};
+    use super::{document_title, push_title, session_from_path, title_to_send, wants_cpu};
+
+    /// A page served at `/s/<name>` joins session `name`; other paths join nothing.
+    #[test]
+    fn session_comes_from_the_page_path() {
+        assert_eq!(session_from_path("/s/office-plan"), Some("office-plan"));
+        assert_eq!(session_from_path("/s/plan_2/"), Some("plan_2"));
+        for path in ["/", "/index.html", "/s/", "/s/a/b", "/s/a.js"] {
+            assert_eq!(session_from_path(path), None, "{path}");
+        }
+    }
 
     /// Guards the `?cpu` URL flag: only a whole `cpu` query parameter (bare or with a value)
     /// selects the CPU canvas, so `?sample` and `?gpucpu` stay on the GPU path.

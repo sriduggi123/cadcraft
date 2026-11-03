@@ -682,7 +682,10 @@ name = "cadcraft-collab-net"
 version = "0.16.0"
 dependencies = [
  "cadcraft-collab",
+ "js-sys",
  "tungstenite",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -824,7 +827,9 @@ name = "cadcraft-server"
 version = "0.16.0"
 dependencies = [
  "cadcraft-collab",
+ "cadcraft-doc",
  "cadcraft-engine",
+ "cadcraft-io",
  "clap",
  "serde_json",
  "tungstenite",
