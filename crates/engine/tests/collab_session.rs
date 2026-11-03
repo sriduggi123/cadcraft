@@ -74,7 +74,7 @@ impl Net {
         let Some(msg) = self.members[i].wire.lock().unwrap().up.pop_front() else { return false };
         match msg {
             ClientMsg::Hello { name, seed, .. } => {
-                let (id, out) = self.server.join(&name, seed.as_deref()).unwrap();
+                let (id, out) = self.server.join(&name, seed.as_deref(), None).unwrap();
                 self.members[i].id = Some(id);
                 self.route(out);
             }
@@ -419,4 +419,30 @@ fn the_block_editor_locks_its_block() {
     net.members[1].session.execute("bedit", &json!({"name": "Bolt"})).unwrap();
     net.members[1].session.collab_tick();
     assert!(net.members[1].session.state().unwrap().block_edit.is_some());
+}
+
+/// Two people colour the same line at the same moment: the one whose change was overwritten is
+/// told; nobody is told about edits made one after the other.
+#[test]
+fn an_overwritten_change_is_reported() {
+    use serde_json::json;
+    let mut net = two_people();
+    net.members[0].session.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    net.quiesce();
+    let line = doc(&net.members[0].session).model.iter().next().map(|e| e.handle.hex()).unwrap();
+    let told = |s: &Session| s.log.iter().filter(|l| l.contains("at the same time")).count();
+
+    net.members[1].session.execute("properties.set", &json!({"handles": [line], "color": 3})).unwrap();
+    net.quiesce();
+    net.members[0].session.execute("properties.set", &json!({"handles": [line], "color": 4})).unwrap();
+    net.quiesce();
+    assert_eq!((told(&net.members[0].session), told(&net.members[1].session)), (0, 0), "one after the other: no warning");
+
+    net.members[0].session.execute("properties.set", &json!({"handles": [line], "color": 1})).unwrap();
+    net.members[1].session.execute("properties.set", &json!({"handles": [line], "color": 5})).unwrap();
+    net.deliver(0);
+    net.deliver(1);
+    net.quiesce();
+    assert_eq!((told(&net.members[0].session), told(&net.members[1].session)), (1, 0), "Asha's red was overwritten by Bo's blue");
+    assert!(net.members[0].session.log.iter().any(|l| l.starts_with("user1 changed 1 thing")), "{:?}", net.members[0].session.log);
 }

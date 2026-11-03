@@ -216,6 +216,13 @@ fn presence_reaches_the_others_and_follow_copies_the_view() {
     let peers = b.execute("collab.peers", &json!({})).unwrap();
     assert_eq!(peers["peers"][0]["cursor"], json!([3.0, 4.0]), "{peers}");
 
+    // Asha starts a line: Bo sees its rubber band from her first point to her cursor.
+    a.cmdline("line").unwrap();
+    a.cmdline("0,0").unwrap();
+    a.collab_presence(Some(cadcraft_engine::geom::Vec2::new(5.0, 5.0)), 1.5);
+    wait(&mut b, "Asha's rubber band", |s| seen(s).is_some_and(|p| p.command.as_deref() == Some("LINE") && !p.preview.is_empty()));
+    a.cancel();
+
     // Bo follows Asha; her zoom moves his view.
     b.execute("collab.follow", &json!({"name": "asha"})).unwrap();
     a.execute("zoom", &json!({"mode": "center", "center": [1, 1], "height": 2})).unwrap();
@@ -234,4 +241,65 @@ fn presence_reaches_the_others_and_follow_copies_the_view() {
     let start = Instant::now();
     assert!(cadcraft_engine::cmd::collab::cloud_connect("ws://10.255.255.1:9/s/x").is_err());
     assert!(start.elapsed() < Duration::from_secs(20), "connecting took {:?}", start.elapsed());
+}
+
+/// A relay in front of the server whose connections can be cut, as a dropped Wi-Fi does.
+struct Relay {
+    addr: std::net::SocketAddr,
+    conns: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+}
+
+impl Relay {
+    fn new(to: std::net::SocketAddr) -> Relay {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keep = conns.clone();
+        std::thread::spawn(move || {
+            for down in listener.incoming().flatten() {
+                let up = std::net::TcpStream::connect(to).unwrap();
+                keep.lock().unwrap().extend([down.try_clone().unwrap(), up.try_clone().unwrap()]);
+                for (mut from, mut to) in [(down.try_clone().unwrap(), up.try_clone().unwrap()), (up, down)] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Relay { addr, conns }
+    }
+
+    fn cut(&self) {
+        for s in self.conns.lock().unwrap().drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// A dropped connection comes back by itself: the person keeps their client id, what they drew
+/// while away reaches the others, and what the others drew meanwhile reaches them.
+#[test]
+fn a_dropped_connection_reconnects_and_catches_up() {
+    let server = start_with(cadcraft_server::Config::default());
+    let relay = Relay::new(server);
+    let mut a = Session::new();
+    a.execute("collab.join", &json!({"url": format!("ws://{}/s/wifi", relay.addr), "name": "Asha", "host": true})).unwrap();
+    let mut b = Session::new();
+    b.execute("collab.join", &json!({"url": format!("ws://{server}/s/wifi"), "name": "Bo"})).unwrap();
+    let id = a.collab_status().map(|(c, _, _)| c);
+    a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    wait(&mut b, "Asha's circle", |s| model_len(s) == 1);
+
+    relay.cut();
+    wait(&mut a, "Asha to notice the drop", Session::collab_reconnecting);
+    a.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    b.execute("text", &json!({"at": [3, 3], "text": "from Bo", "height": 2})).unwrap();
+
+    wait(&mut a, "Asha back with Bo's text", |s| !s.collab_reconnecting() && model_len(s) == 3);
+    assert_eq!(a.collab_status().map(|(c, _, _)| c), id, "Asha keeps her client id");
+    assert!(a.log.iter().any(|l| l == "Reconnected."), "{:?}", a.log);
+    wait(&mut b, "the line Asha drew while away", |s| model_len(s) == 3);
+    a.execute("circle", &json!({"center": [20, 0], "radius": 2})).unwrap();
+    wait(&mut b, "Asha's next edit", |s| model_len(s) == 4);
 }

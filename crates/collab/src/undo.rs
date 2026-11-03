@@ -10,7 +10,7 @@ use crate::{Change, Container, Result, diff};
 
 /// What a change writes: two changes to the same key overwrite each other.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Key {
+pub(crate) enum Key {
     Entity(Handle),
     Prop(Handle, String),
     Geometry(Handle),
@@ -21,7 +21,7 @@ enum Key {
     Entry(String, String),
 }
 
-fn key(c: &Change) -> Key {
+pub(crate) fn key(c: &Change) -> Key {
     match c {
         Change::Delete { id } | Change::Create { id, .. } => Key::Entity(*id),
         Change::Common { id, prop, .. } => Key::Prop(*id, prop.clone()),

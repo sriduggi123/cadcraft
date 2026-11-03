@@ -114,6 +114,14 @@ mod web {
         Some(format!("{scheme}://{}/s/{name}", loc.host().ok()?))
     }
 
+    /// The page's own server as a cloud address (`wss://` under `https://`): the Cloud Files
+    /// dialog's default in the browser.
+    fn web_origin() -> Option<String> {
+        let loc = web_sys::window()?.location();
+        let scheme = if loc.protocol().ok()? == "https:" { "wss" } else { "ws" };
+        Some(format!("{scheme}://{}", loc.host().ok()?))
+    }
+
     /// No file picker on the web: Save / Save As from the menu (and the close prompt) download the
     /// drawing under its current name; `saveas {"path": "name.dxf"}` picks another name. There is
     /// no file system either, so a dropped file is opened from its contents and APPLOAD says to
@@ -196,6 +204,11 @@ mod web {
                         }
                         if query().contains("sample") {
                             let _ = app.run("ui.sample", serde_json::json!({}));
+                        }
+                        if app.cloud.server.trim().is_empty()
+                            && let Some(origin) = web_origin()
+                        {
+                            app.cloud.server = origin;
                         }
                         // Opened from a session server at `/s/<name>`: join that session there.
                         if let Some(url) = web_session_url() {

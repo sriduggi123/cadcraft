@@ -86,26 +86,43 @@ fn run_cloud_list(_: &mut Session, p: &Value) -> Result<Value> {
 /// the network, so the desktop UI calls it from a background thread.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn list_files(server: &str) -> Result<Vec<Value>> {
-    use cadcraft_collab::message::{ClientMsg, ServerMsg};
-    let mut link = cadcraft_collab_net::connect(&format!("{server}/files")).map_err(|e| EngineError::Other(e.to_string()))?;
-    link.send(&ClientMsg::List).map_err(|e| EngineError::Other(e.to_string()))?;
+    let mut link = list_start(server)?;
     let start = Instant::now();
     loop {
-        match link.recv() {
-            Some(Ok(ServerMsg::Files { files })) => {
-                return Ok(files.iter().map(|f| json!({"name": f.name, "modified": f.modified, "people": f.people})).collect());
-            }
-            Some(Ok(ServerMsg::Error { message })) => return Err(EngineError::Other(message)),
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(EngineError::Other(e.to_string())),
-            None if !link.is_open() => return Err(EngineError::Other("the server closed the connection".into())),
-            None => {}
+        if let Some(r) = list_poll(link.as_mut()) {
+            return r;
         }
         if start.elapsed() > LIST_WAIT {
             return Err(EngineError::Other("the server did not answer in time".into()));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Ask `server` for its files; [`list_poll`] reads the answer (the browser does on later frames).
+pub fn list_start(server: &str) -> Result<Box<dyn cadcraft_collab::Link>> {
+    let mut link = cloud_connect(&format!("{server}/files"))?;
+    link.send(&cadcraft_collab::message::ClientMsg::List).map_err(|e| EngineError::Other(e.to_string()))?;
+    Ok(link)
+}
+
+/// The answer to [`list_start`]: the files, an error, or `None` while it hasn't come.
+pub fn list_poll(link: &mut dyn cadcraft_collab::Link) -> Option<Result<Vec<Value>>> {
+    use cadcraft_collab::message::ServerMsg;
+    let fail = |e: String| Some(Err(EngineError::Other(e)));
+    for _ in 0..16 {
+        match link.recv() {
+            Some(Ok(ServerMsg::Files { files })) => {
+                return Some(Ok(files.iter().map(|f| json!({"name": f.name, "modified": f.modified, "people": f.people})).collect()));
+            }
+            Some(Ok(ServerMsg::Error { message })) => return fail(message),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return fail(e.to_string()),
+            None if !link.is_open() => return fail("the server closed the connection".into()),
+            None => return None,
+        }
+    }
+    None
 }
 
 /// Open a cloud file in a new tab, or make the active drawing a new one.
@@ -214,7 +231,7 @@ fn run_join(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param(p, "name").unwrap_or("CADCraft user");
     let host = p.get("host").and_then(Value::as_bool).unwrap_or(false);
     let link = cadcraft_collab_net::connect(url).map_err(|e| EngineError::Other(e.to_string()))?;
-    s.collab_attach(link, name, host)?;
+    s.collab_attach_to(link, url, name, host, false)?;
     wait_for_welcome(s)?;
     run_peers(s, &json!({}))
 }

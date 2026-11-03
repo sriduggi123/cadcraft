@@ -319,7 +319,7 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
         }
         (ClientMsg::Hello { .. }, None) if name.is_empty() => refuse(tx, "join a file at /s/<name>"),
         (ClientMsg::Hello { create: true, .. }, None) if rooms.exists(name) => refuse(tx, &format!("a cloud file named {name} already exists")),
-        (ClientMsg::Hello { name: who, seed, .. }, None) => {
+        (ClientMsg::Hello { name: who, seed, resume, .. }, None) => {
             // Read a saved session before taking the lock; it is used only if the room is new.
             let saved = if rooms.lock().contains_key(name) {
                 None
@@ -340,7 +340,7 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
             if room.conns.len() >= MAX_PEOPLE {
                 return refuse(tx, "the session is full");
             }
-            let (id, out) = match room.server.join(&who, seed.as_deref()) {
+            let (id, out) = match room.server.join(&who, seed.as_deref(), resume) {
                 Ok(j) => j,
                 Err(e) => return refuse(tx, &e.to_string()),
             };

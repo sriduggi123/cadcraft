@@ -1116,12 +1116,18 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
             painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Middle);
         }
     }
-    // Other people in a shared session (not inside a layout viewport, whose model space they
-    // don't share coordinates with).
-    app.cloud.cursor = raw_world.filter(|_| active_vp.is_none());
-    if active_vp.is_none() {
-        crate::cloud::paint_presence(app, painter, &xf, rect);
+    // Other people in a shared session, in the coordinates of the tab shown (the sheet's on a
+    // layout, also inside a viewport); their rubber bands outside layout viewports.
+    app.cloud.cursor = hover_pos.filter(|_| inside).map(|p| xf_paper.to_world(p));
+    if active_vp.is_none()
+        && let Ok(st) = app.session.state()
+    {
+        for ents in crate::cloud::previews(app) {
+            let list = rebuilt_preview(&st.doc, ents.iter(), scale);
+            draw_list(painter, &xf, &list, bg, false);
+        }
     }
+    crate::cloud::paint_presence(app, painter, &xf_paper, rect);
     paint_pointer_overlay(
         &mut CanvasPaint {
             app,

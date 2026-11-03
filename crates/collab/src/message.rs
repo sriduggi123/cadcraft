@@ -14,8 +14,9 @@ pub const MAX_MESSAGE_BYTES: usize = crate::snapshot::MAX_BYTES + (1 << 20);
 pub enum ClientMsg {
     /// The first message: who is joining, and, from the person who starts the session, the
     /// drawing to start it with (a [`crate::snapshot`]); ignored once the session has one.
-    /// `create`: this must be a new file; the server refuses if the name is taken.
-    Hello { name: String, seed: Option<Vec<u8>>, create: bool },
+    /// `create`: this must be a new file; the server refuses if the name is taken. `resume`: the
+    /// client id this person had before their connection dropped, to keep their handle space.
+    Hello { name: String, seed: Option<Vec<u8>>, create: bool, resume: Option<u32> },
     /// One command's changes. `batch` numbers the client's batches, so replies can name them;
     /// `base` is the last batch the server had confirmed to this client when it made them, so
     /// everyone can tell which batches were made at the same time.
@@ -45,7 +46,14 @@ pub struct Presence {
     pub command: Option<String>,
     /// The view: center x, center y and height, in drawing units.
     pub view: Option<[f64; 3]>,
+    /// The running command's rubber band: the objects it would make at the cursor (at most
+    /// [`MAX_PREVIEW`], as entity JSON).
+    pub preview: Vec<crate::Json>,
 }
+
+/// Most preview objects a presence message carries, and their largest total size in bytes.
+pub const MAX_PREVIEW: usize = 20;
+pub const MAX_PREVIEW_BYTES: usize = 32 * 1024;
 
 /// A file in the cloud: a saved or live session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

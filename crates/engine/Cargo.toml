@@ -12,6 +12,7 @@ workspace = true
 # Shared sessions (the fork's multiplayer work).
 cadcraft-collab = { workspace = true }
 cadcraft-collab-net = { workspace = true }
+web-time = { workspace = true }
 cadcraft-geom = { workspace = true }
 cadcraft-color = { workspace = true }
 cadcraft-doc = { workspace = true }

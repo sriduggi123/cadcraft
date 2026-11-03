@@ -30,7 +30,14 @@ pub struct State {
 
 /// Network work in progress.
 enum Busy {
+    #[cfg(not(target_arch = "wasm32"))]
     List(Receiver<Result<Vec<Value>, String>>),
+    /// The browser asks for the list over its WebSocket and reads the answer on a later frame.
+    #[cfg(target_arch = "wasm32")]
+    Listing {
+        link: Box<dyn cadcraft_engine::collab::Link>,
+        since: f64,
+    },
     Connect {
         how: CloudJoin,
         name: String,
@@ -112,8 +119,29 @@ fn refresh(app: &mut CadApp) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        app.cloud.error = Some(format!("open {} in the browser for the file list", server.replacen("ws", "http", 1)));
+        match cloud::list_start(&server) {
+            Ok(link) => app.cloud.busy = Some(Busy::Listing { link, since: crate::now_ms() / 1000.0 }),
+            Err(e) => app.cloud.error = Some(e.to_string()),
+        }
     }
+}
+
+/// The browser's list: the answer, an error, or still waiting.
+#[cfg(target_arch = "wasm32")]
+fn poll_listing(app: &mut CadApp, mut link: Box<dyn cadcraft_engine::collab::Link>, since: f64, now: f64) -> Option<Busy> {
+    let result = match cloud::list_poll(link.as_mut()) {
+        Some(r) => r.map_err(|e| e.to_string()),
+        None if now - since > 10.0 => Err("the server did not answer in time".into()),
+        None => return Some(Busy::Listing { link, since }),
+    };
+    match result {
+        Ok(files) => app.cloud.files = files,
+        Err(e) => {
+            app.cloud.files.clear();
+            app.cloud.error = Some(e);
+        }
+    }
+    None
 }
 
 /// Open or save `name` in the background.
@@ -145,6 +173,9 @@ pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(50));
     let now = ctx.input(|i| i.time);
     app.cloud.busy = match busy {
+        #[cfg(target_arch = "wasm32")]
+        Busy::Listing { link, since } => poll_listing(app, link, since, crate::now_ms() / 1000.0),
+        #[cfg(not(target_arch = "wasm32"))]
         Busy::List(rx) => match rx.try_recv() {
             Ok(Ok(files)) => {
                 app.cloud.files = files;
@@ -195,22 +226,14 @@ pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
     };
 }
 
-/// "3 min ago" for a time in seconds since 1970 (empty in the browser, which has no clock here).
+/// "3 min ago" for a time in seconds since 1970.
 fn ago(modified: u64) -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = modified;
-        String::new()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        match now.saturating_sub(modified) {
-            0..60 => crate::tl!("just now").to_string(),
-            s @ 60..3600 => format!("{} min ago", s / 60),
-            s @ 3600..86_400 => format!("{} h ago", s / 3600),
-            s => format!("{} days ago", s / 86_400),
-        }
+    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match now.saturating_sub(modified) {
+        0..60 => crate::tl!("just now").to_string(),
+        s @ 60..3600 => format!("{} min ago", s / 60),
+        s @ 3600..86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
     }
 }
 
@@ -241,7 +264,13 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
                 action = Some(Action::Refresh);
             }
             match &st.busy {
+                #[cfg(not(target_arch = "wasm32"))]
                 Some(Busy::List(_)) => {
+                    ui.spinner();
+                    ui.label(crate::tl!("Loading…"));
+                }
+                #[cfg(target_arch = "wasm32")]
+                Some(Busy::Listing { .. }) => {
                     ui.spinner();
                     ui.label(crate::tl!("Loading…"));
                 }
@@ -329,6 +358,34 @@ fn colour(client: u32) -> Color32 {
     p.get(client as usize % p.len()).copied().unwrap_or(Color32::GRAY)
 }
 
+/// The others' rubber bands on the shared tab, as objects in their colour.
+pub fn previews(app: &CadApp) -> Vec<Vec<cadcraft_doc::Entity>> {
+    let Ok(st) = app.session.state() else { return Vec::new() };
+    if app.session.collab_uid() != Some(st.uid) {
+        return Vec::new();
+    }
+    let layout = match &st.space {
+        cadcraft_doc::Space::Model => String::new(),
+        cadcraft_doc::Space::Paper(n) => n.clone(),
+    };
+    app.session
+        .collab_others()
+        .into_iter()
+        .filter(|(_, p)| p.layout == layout && !p.preview.is_empty())
+        .map(|(peer, p)| {
+            let c = colour(peer.client);
+            p.preview
+                .iter()
+                .filter_map(|j| serde_json::from_value::<cadcraft_doc::Entity>(j.0.clone()).ok())
+                .map(|mut e| {
+                    e.common.color = cadcraft_color::Color::True(cadcraft_color::Rgb(c.r(), c.g(), c.b()));
+                    e
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Most objects outlined per person.
 const MAX_OUTLINES: usize = 500;
 
@@ -344,10 +401,12 @@ pub fn paint_presence(app: &CadApp, painter: &egui::Painter, xf: &crate::canvas:
         cadcraft_doc::Space::Paper(n) => n.clone(),
     };
     let painter = painter.with_clip_rect(rect);
+    let Some(shown) = st.doc.space(&st.space) else { return };
     for (peer, p) in app.session.collab_others().iter().filter(|(_, p)| p.layout == layout) {
         let c = colour(peer.client);
         for h in p.selection.iter().take(MAX_OUTLINES) {
-            let Some(e) = st.doc.entity(*h) else { continue };
+            // Only objects of the space shown: a layout tab shows model objects through viewports.
+            let Some(e) = shown.get(*h) else { continue };
             let b = cadcraft_doc::extent_bounds(&st.doc, e);
             if b.is_empty() {
                 continue;
@@ -388,6 +447,7 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
     let people = app.session.collab_status().map_or(0, |(_, p, _)| p.len());
     let lead = app.session.collab_following().and_then(|c| app.session.collab_others().into_iter().find(|(p, _)| p.client == c)).map(|(p, _)| p.name);
     let text = match lead {
+        _ if app.session.collab_reconnecting() => format!("Cloud: {name} · reconnecting…"),
         Some(lead) => format!("Cloud: {name} · {people} here · following {lead}"),
         None => format!("Cloud: {name} · {people} here"),
     };

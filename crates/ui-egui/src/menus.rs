@@ -24,9 +24,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.dock.reset", "Reset Panel Layout", &["Window", "Reset Panel Layout"], None),
     ("ui.open", "Open...", &[], Some("Cmd+O")),
     ("ui.newtemplate", "New from Template...", &["File", "New from Template..."], None),
-    #[cfg(not(target_arch = "wasm32"))]
     ("ui.cloud", "Open from Cloud...", &["File", "Open from Cloud..."], None),
-    #[cfg(not(target_arch = "wasm32"))]
     ("ui.cloud.save", "Save to Cloud...", &["File", "Save to Cloud..."], None),
     ("ui.saveas", "Save As...", &[], None),
     ("ui.sample", "Open Sample Drawing", &["Help", "Open Sample Drawing"], None),

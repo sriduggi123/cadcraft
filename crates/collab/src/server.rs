@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cadcraft_doc::{Drawing, Handle};
 
-use crate::message::{MAX_SELECTION, Peer, Presence, ServerMsg};
+use crate::message::{MAX_PREVIEW, MAX_PREVIEW_BYTES, MAX_SELECTION, Peer, Presence, ServerMsg};
 use crate::{Change, Container, Error, Result, apply, snapshot, space};
 
 /// Most changes in one batch.
@@ -86,7 +86,7 @@ impl Server {
     }
 
     /// Someone joins: their id, and the messages to send (their welcome, everyone's peer list).
-    pub fn join(&mut self, name: &str, seed: Option<&[u8]>) -> Result<(u32, Vec<Outgoing>)> {
+    pub fn join(&mut self, name: &str, seed: Option<&[u8]>, resume: Option<u32>) -> Result<(u32, Vec<Outgoing>)> {
         if self.drawing.is_none() {
             let d = match seed {
                 Some(bytes) => snapshot::decode(bytes)?,
@@ -95,8 +95,16 @@ impl Server {
             self.start(d);
         }
         let d = self.drawing.as_ref().ok_or_else(|| Error::Invalid("no drawing".into()))?;
-        let client = self.next_client;
-        self.next_client = self.next_client.checked_add(1).ok_or_else(|| Error::Invalid("no client ids left".into()))?;
+        // Someone back after a dropped connection keeps their id (and handle space) while nobody
+        // else has it.
+        let client = match resume.filter(|c| *c > 0 && *c < self.next_client && !self.clients.contains_key(c)) {
+            Some(c) => c,
+            None => {
+                let c = self.next_client;
+                self.next_client = self.next_client.checked_add(1).ok_or_else(|| Error::Invalid("no client ids left".into()))?;
+                c
+            }
+        };
         let welcome = ServerMsg::Welcome { client, seq: self.seq, snapshot: snapshot::encode(d)? };
         self.clients.insert(client, name.chars().take(64).collect());
         let mut out = vec![Outgoing { to: To::One(client), msg: welcome }, self.peers_msg()];
@@ -136,6 +144,10 @@ impl Server {
             return Vec::new();
         }
         presence.selection.truncate(MAX_SELECTION);
+        presence.preview.truncate(MAX_PREVIEW);
+        if presence.preview.iter().map(|j| j.0.to_string().len()).sum::<usize>() > MAX_PREVIEW_BYTES {
+            presence.preview.clear();
+        }
         presence.layout = presence.layout.chars().take(256).collect();
         presence.command = presence.command.map(|c| c.chars().take(64).collect());
         self.presence.insert(client, presence.clone());

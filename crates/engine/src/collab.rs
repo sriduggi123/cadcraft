@@ -9,6 +9,9 @@
 //! the server while open; REFEDIT, which edits a block in place in the drawing, is refused.
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+use web_time::{Duration, Instant};
 
 pub use cadcraft_collab::Link;
 use cadcraft_collab::client::Client;
@@ -22,6 +25,11 @@ use crate::{EngineError, Result, Session};
 
 /// Most messages applied in one tick, so a burst doesn't stall a frame.
 const MAX_PER_TICK: usize = 256;
+
+/// How long a dropped connection is tried again before the session ends, and the longest wait
+/// between tries.
+const RECONNECT_FOR: Duration = Duration::from_secs(120);
+const RECONNECT_MAX_WAIT: Duration = Duration::from_secs(15);
 
 /// Least time between two presence messages, in seconds (20 a second at most).
 const PRESENCE_EVERY: f64 = 0.05;
@@ -52,6 +60,38 @@ pub struct Live {
     known: Option<Arc<Drawing>>,
     /// The block this person has locked for the Block Editor.
     locked: Option<String>,
+    /// The name shown to others.
+    name: String,
+    /// The connection dropped and is being made again.
+    retry: Option<Retry>,
+    /// A new connection sent its hello: the next welcome is a rejoin.
+    rejoining: bool,
+}
+
+/// Connecting again after the connection dropped.
+struct Retry {
+    since: Instant,
+    next: Instant,
+    tries: u32,
+    connecting: Option<Receiver<std::result::Result<Box<dyn Link>, String>>>,
+}
+
+/// Connect to `url` without waiting: natively on a thread, in the browser at once (its WebSocket
+/// opens in the background).
+fn connect_later(url: &str) -> Receiver<std::result::Result<Box<dyn Link>, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = url.to_string();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = std::thread::Builder::new().name("collab-reconnect".into()).spawn(move || {
+            let _ = tx.send(cadcraft_collab_net::connect(&url).map_err(|e| e.to_string()));
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx.send(cadcraft_collab_net::connect(&url).map_err(|e| e.to_string()));
+    }
+    rx
 }
 
 impl Session {
@@ -71,7 +111,7 @@ impl Session {
         let seed = if host { Some(snapshot::encode(&st.doc).map_err(|e| EngineError::Other(e.to_string()))?) } else { None };
         let uid = st.uid;
         let mut link = link;
-        link.send(&ClientMsg::Hello { name: name.to_string(), seed, create }).map_err(|e| EngineError::Other(e.to_string()))?;
+        link.send(&ClientMsg::Hello { name: name.to_string(), seed, create, resume: None }).map_err(|e| EngineError::Other(e.to_string()))?;
         self.collab = Some(Live {
             link,
             uid,
@@ -84,6 +124,9 @@ impl Session {
             followed: None,
             known: None,
             locked: None,
+            name: name.to_string(),
+            retry: None,
+            rejoining: false,
         });
         Ok(())
     }
@@ -147,9 +190,53 @@ impl Session {
         if self.running.is_some() || self.lisp_busy() {
             return;
         }
+        if self.collab.as_ref().is_some_and(|l| l.retry.is_some()) {
+            return self.collab_retry();
+        }
         self.collab_sync_lock();
         self.collab_drain();
         self.collab_follow_step();
+    }
+
+    /// Whether the connection dropped and is being made again.
+    pub fn collab_reconnecting(&self) -> bool {
+        self.collab.as_ref().is_some_and(|l| l.ended.is_none() && (l.retry.is_some() || l.rejoining))
+    }
+
+    /// Try the dropped connection again: one try at a time, waiting 1, 2, 4… up to 15 seconds
+    /// between them, for two minutes.
+    fn collab_retry(&mut self) {
+        let Some(live) = self.collab.as_mut() else { return };
+        let Some(retry) = live.retry.as_mut() else { return };
+        let now = Instant::now();
+        if let Some(rx) = &retry.connecting {
+            let result = match rx.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err("the connection attempt stopped".into()),
+            };
+            retry.connecting = None;
+            if let Ok(link) = result {
+                let id = live.client.as_ref().map(Client::id);
+                live.link = link;
+                let hello = ClientMsg::Hello { name: live.name.clone(), seed: None, create: false, resume: id };
+                if live.link.send(&hello).is_ok() {
+                    live.retry = None;
+                    live.rejoining = true;
+                    return;
+                }
+            }
+            let Some(retry) = live.retry.as_mut() else { return };
+            retry.tries += 1;
+            retry.next = now + Duration::from_secs(1u64 << retry.tries.min(4)).min(RECONNECT_MAX_WAIT);
+            return;
+        }
+        if now.duration_since(retry.since) > RECONNECT_FOR {
+            return self.collab_end("the connection to the server was lost and could not be made again".into());
+        }
+        if now >= retry.next {
+            retry.connecting = Some(connect_later(&live.url));
+        }
     }
 
     fn collab_drain(&mut self) {
@@ -205,7 +292,18 @@ impl Session {
             let msg = match live.link.recv() {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => return self.collab_end(format!("a message from the server could not be read: {e}")),
-                None if !live.link.is_open() => return self.collab_end("the connection to the server closed".into()),
+                None if !live.link.is_open() => {
+                    // A joined session with an address tries again; one without ends.
+                    if live.client.is_some() && !live.url.is_empty() {
+                        // The first try waits a second, so the server has seen the drop and
+                        // gives this person their id back.
+                        let now = Instant::now();
+                        live.retry = Some(Retry { since: now, next: now + Duration::from_secs(1), tries: 0, connecting: None });
+                        live.rejoining = false;
+                        return self.echo("Connection to the server lost; reconnecting…");
+                    }
+                    return self.collab_end("the connection to the server closed".into());
+                }
                 None => return,
             };
             if let Err(e) = self.collab_receive(msg) {
@@ -219,7 +317,9 @@ impl Session {
     /// from the session. Sent only when it changed, 20 times a second at most. The UI calls it
     /// every frame.
     pub fn collab_presence(&mut self, cursor: Option<Vec2>, now: f64) {
-        let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none()) else { return };
+        let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none() && l.retry.is_none() && !l.rejoining) else {
+            return;
+        };
         let uid = live.uid;
         let mut p = Presence::default();
         if let Some(st) = self.docs.get(self.active).filter(|d| d.uid == uid && d.block_edit.is_none()) {
@@ -227,7 +327,21 @@ impl Session {
             p.cursor = cursor.filter(|c| c.is_finite()).map(|c| [c.x, c.y]);
             p.selection = st.selection.iter().take(MAX_SELECTION).copied().collect();
             p.command = self.running.as_ref().map(|r| r.id.to_ascii_uppercase());
-            let v = st.view();
+            // The rubber band, unless inside a layout viewport (its model coordinates aren't the
+            // sheet's, which the cursor is in).
+            if let (Some(c), Some(_), None) = (cursor.filter(|c| c.is_finite()), &self.running, st.mspace) {
+                let mut size = 0;
+                for e in self.preview(c).iter().take(cadcraft_collab::message::MAX_PREVIEW) {
+                    let Ok(j) = cadcraft_collab::Json::of(e) else { continue };
+                    size += j.0.to_string().len();
+                    if size > cadcraft_collab::message::MAX_PREVIEW_BYTES {
+                        break;
+                    }
+                    p.preview.push(j);
+                }
+            }
+            // Inside a layout viewport, the sheet's view: that is what others on the tab share.
+            let v = if st.mspace.is_some() { st.paper_view() } else { st.view() };
             p.view = Some([v.center.x, v.center.y, v.height]);
         }
         let Some(live) = self.collab.as_mut() else { return };
@@ -279,7 +393,22 @@ impl Session {
             self.collab_follow(None);
             return self.echo(format!("Stopped following {name}."));
         }
-        let Some(lead) = lead.filter(|p| p.layout == layout_name(&st.space)) else { return };
+        let Some(lead) = lead else { return };
+        // Go to the layout they are on (when the drawing has it).
+        if lead.layout != layout_name(&st.space) {
+            let to = if lead.layout.is_empty() { Space::Model } else { Space::Paper(lead.layout.clone()) };
+            if to != Space::Model && !st.doc.layouts.iter().any(|l| l.name == lead.layout) {
+                return;
+            }
+            st.space = to;
+            st.mspace = None;
+            st.revision += 1;
+        }
+        // A follower inside a layout viewport goes back to the sheet, whose view is shared.
+        if st.mspace.is_some() {
+            st.mspace = None;
+            st.revision += 1;
+        }
         let Some([x, y, h]) = lead.view else { return };
         let v = View { center: Vec2::new(x, y), height: h };
         if !same_view(&v, &st.view()) {
@@ -343,6 +472,7 @@ impl Session {
         let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid) else {
             return Err("the shared drawing was closed".into());
         };
+        let mut rejoined = None;
         let view = match (&mut live.client, msg) {
             (None, ServerMsg::Welcome { client, seq, snapshot }) => {
                 let (c, view) = Client::welcome(client, seq, &snapshot).map_err(|e| e.to_string())?;
@@ -354,6 +484,25 @@ impl Session {
             }
             (None, ServerMsg::Error { message }) => return Err(message),
             (None, _) => None,
+            (Some(_), ServerMsg::Welcome { client, seq, snapshot }) if live.rejoining => {
+                live.rejoining = false;
+                // The server let go of this person's block lock and presence when they dropped.
+                live.locked = None;
+                live.sent = None;
+                let Some(old) = live.client.take() else { return Ok(()) };
+                let was = old.id();
+                let (c, view, msg) = old.rejoin(client, seq, &snapshot, st.drawing()).map_err(|e| e.to_string())?;
+                live.client = Some(c);
+                if let Some(m) = msg {
+                    live.link.send(&m).map_err(|e| e.to_string())?;
+                }
+                rejoined = Some(if client == was {
+                    "Reconnected.".to_string()
+                } else {
+                    "Reconnected under a new client id: objects you drew while away may be refused.".to_string()
+                });
+                Some(view)
+            }
             (Some(c), msg) => c.receive(msg, st.drawing()).map_err(|e| e.to_string())?.view,
         };
         let notices = live.client.as_mut().map(Client::take_notices).unwrap_or_default();
@@ -367,7 +516,7 @@ impl Session {
             st.revision += 1;
             live.known = Some(view);
         }
-        notices.into_iter().for_each(|n| self.echo(n));
+        notices.into_iter().chain(rejoined).for_each(|n| self.echo(n));
         Ok(())
     }
 
@@ -379,6 +528,10 @@ impl Session {
         self.collab_sync_lock();
         let Some(after) = self.docs.iter().find(|d| d.uid == uid).map(|d| d.drawing().clone()) else { return };
         let Some(live) = self.collab.as_mut().filter(|l| l.uid == uid && l.ended.is_none()) else { return };
+        // Edits made while the connection is down go out when it is back (`Client::rejoin`).
+        if live.retry.is_some() || live.rejoining {
+            return;
+        }
         let Some(client) = live.client.as_mut() else { return };
         let before = live.known.clone().unwrap_or_else(|| before.clone());
         if Arc::ptr_eq(&before, &after) {
@@ -391,7 +544,15 @@ impl Session {
             Err(e) => Err(e),
         };
         if let Err(e) = sent {
-            self.collab_end(format!("{id}'s changes could not be sent: {e}"));
+            // A link that broke while sending: try again like a dropped one; the edit goes out then.
+            match self.collab.as_mut().filter(|l| !l.url.is_empty()) {
+                Some(live) => {
+                    let now = Instant::now();
+                    live.retry = Some(Retry { since: now, next: now + Duration::from_secs(1), tries: 0, connecting: None });
+                    self.echo("Connection to the server lost; reconnecting…");
+                }
+                None => self.collab_end(format!("{id}'s changes could not be sent: {e}")),
+            }
         }
     }
 }

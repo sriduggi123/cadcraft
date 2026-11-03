@@ -13,6 +13,8 @@ use crate::{Change, Error, Result, apply, diff, snapshot, space, vars};
 /// Most renames remembered, and the longest chain of them followed.
 const MAX_RENAMES: usize = 10_000;
 const MAX_RENAME_CHAIN: usize = 64;
+/// This person's own accepted batches remembered for conflict warnings.
+const MAX_MINE: usize = 64;
 /// Accepted batches remembered to find the ones made at the same time.
 const MAX_RECENT: usize = 256;
 
@@ -30,6 +32,8 @@ pub struct Client {
     renames: BTreeMap<(String, String), String>,
     /// The last accepted batches: (seq, author, objects touched).
     recent: VecDeque<(u64, u32, BTreeSet<Handle>)>,
+    /// What this person's last accepted batches wrote: (seq, keys).
+    mine: VecDeque<(u64, BTreeSet<crate::undo::Key>)>,
     /// Blocks locked for the Block Editor (lower case) and who holds each.
     locks: BTreeMap<String, u32>,
     /// See [`Client::take_concurrent`].
@@ -61,11 +65,32 @@ impl Client {
             others: BTreeMap::new(),
             renames: BTreeMap::new(),
             recent: VecDeque::new(),
+            mine: VecDeque::new(),
             locks: BTreeMap::new(),
             concurrent: Vec::new(),
             notices: Vec::new(),
         };
         Ok((c, view))
+    }
+
+    /// Back after a dropped connection: the server's new welcome, with this person's edits it may
+    /// not have (unconfirmed or made while away) replayed on top. Returns the client, the drawing
+    /// to show and the batch that sends those edits (none when the server had them all).
+    pub fn rejoin(self, client: u32, seq: u64, bytes: &[u8], view: &Drawing) -> Result<(Client, Drawing, Option<ClientMsg>)> {
+        let mine = diff(&self.confirmed, view)?;
+        let same = client == self.id;
+        let (mut c, base) = Client::welcome(client, seq, bytes)?;
+        c.renames = self.renames;
+        let mut d = base.clone();
+        crate::apply::apply_lenient(&mut d, &mine);
+        carry_local(view, &mut d);
+        space::enter(&mut d, client);
+        // Handles made and deleted before the drop are never handed out again.
+        if same {
+            d.handseed = d.handseed.max(view.handseed);
+        }
+        let msg = c.local(&base, &d)?;
+        Ok((c, d, msg))
     }
 
     pub fn id(&self) -> u32 {
@@ -124,6 +149,26 @@ impl Client {
         }
     }
 
+    /// Tell this person when someone, editing at the same time, changed what they had just
+    /// changed: the later batch is the one kept.
+    fn note_overwrites(&mut self, seq: u64, client: u32, base: u64, changes: &[Change]) {
+        let keys: BTreeSet<crate::undo::Key> = changes.iter().map(crate::undo::key).collect();
+        if client == self.id {
+            self.mine.push_back((seq, keys));
+            if self.mine.len() > MAX_MINE {
+                self.mine.pop_front();
+            }
+            return;
+        }
+        let hit: BTreeSet<&crate::undo::Key> = self.mine.iter().filter(|(s, _)| *s > base).flat_map(|(_, k)| k.intersection(&keys)).collect();
+        if hit.is_empty() {
+            return;
+        }
+        let who = self.peers.iter().find(|p| p.client == client).map_or("Someone", |p| p.name.as_str());
+        let what = if hit.len() == 1 { "1 thing".to_string() } else { format!("{} things", hit.len()) };
+        self.notices.push(format!("{who} changed {what} you had just changed, at the same time; their change is the one kept."));
+    }
+
     fn note_renames(&mut self, changes: &[Change]) {
         for c in changes {
             if let Change::Entry { field, name, value: Some(v) } = c
@@ -169,6 +214,7 @@ impl Client {
                 apply(&mut self.confirmed, &changes)?;
                 self.note_renames(&changes);
                 self.note_concurrent(seq, client, base, &changes);
+                self.note_overwrites(seq, client, base, &changes);
                 self.seq = seq;
                 if client == self.id {
                     match self.pending.pop_front() {
