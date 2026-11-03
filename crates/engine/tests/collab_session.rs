@@ -83,7 +83,7 @@ impl Net {
                 let out = self.server.batch(id, batch, base, changes);
                 self.route(out);
             }
-            ClientMsg::List => {}
+            ClientMsg::List { .. } => {}
             ClientMsg::Lock { block, on } => {
                 let id = self.members[i].id.unwrap();
                 let out = self.server.lock(id, &block, on);
@@ -115,14 +115,15 @@ impl Net {
                     moved = true;
                 }
             }
+            let waiting = |net: &Net| net.members.iter().map(|m| m.wire.lock().unwrap().down.len()).sum::<usize>();
+            let before = waiting(self);
             for m in &mut self.members {
                 m.session.collab_tick();
             }
-            let idle = self.members.iter().all(|m| {
-                let w = m.wire.lock().unwrap();
-                w.up.is_empty() && w.down.is_empty()
-            });
-            if idle && !moved {
+            // Delivered, and every client read what it would (one inside REFEDIT holds its
+            // messages until REFCLOSE).
+            let idle = self.members.iter().all(|m| m.wire.lock().unwrap().up.is_empty());
+            if idle && !moved && waiting(self) == before {
                 return;
             }
         }
@@ -445,4 +446,39 @@ fn an_overwritten_change_is_reported() {
     net.quiesce();
     assert_eq!((told(&net.members[0].session), told(&net.members[1].session)), (1, 0), "Asha's red was overwritten by Bo's blue");
     assert!(net.members[0].session.log.iter().any(|l| l.starts_with("user1 changed 1 thing")), "{:?}", net.members[0].session.log);
+}
+
+/// REFEDIT in a shared drawing: the block is locked; Asha's in-place changes and Bo's arriving
+/// edits wait until REFCLOSE, which sends the finished block; then Bo's edit reaches Asha.
+#[test]
+fn refedit_holds_its_changes_until_refclose() {
+    use serde_json::json;
+    let mut net = two_people();
+    let a = &mut net.members[0].session;
+    a.execute("circle", &json!({"center": [0, 0], "radius": 1})).unwrap();
+    let h = doc(a).model.iter().next().map(|e| e.handle.hex()).unwrap();
+    a.execute("block", &json!({"name": "Nut", "base": [0, 0], "handles": [h]})).unwrap();
+    a.execute("insert", &json!({"name": "Nut", "at": [10, 0]})).unwrap();
+    let insert = doc(a).model.iter().last().map(|e| e.handle.hex()).unwrap();
+    net.quiesce();
+
+    net.members[0].session.execute("refedit", &json!({"handle": insert})).unwrap();
+    net.members[0].session.execute("line", &json!({"points": [[10, 0], [12, 2]]})).unwrap();
+    net.members[1].session.execute("text", &json!({"at": [0, 5], "text": "from Bo", "height": 1})).unwrap();
+    net.quiesce();
+    assert_eq!(block_len(&net.members[1].session, "Nut"), 1, "nothing leaves REFEDIT before REFCLOSE");
+    let texts = |s: &Session| doc(s).model.iter().filter(|e| e.kind.dxf_name() == "TEXT").count();
+    assert_eq!(texts(&net.members[0].session), 0, "Bo's edit waits");
+    let b = &mut net.members[1].session;
+    let _ = b.execute("refedit", &json!({"handle": insert}));
+    b.collab_tick();
+    assert!(doc(b).refedit.is_none(), "Bo can't edit Nut in place meanwhile");
+
+    net.members[0].session.execute("refclose", &json!({"save": true})).unwrap();
+    net.quiesce();
+    for m in &net.members {
+        assert_eq!(block_len(&m.session, "Nut"), 2, "the edited block reaches everyone");
+        assert_eq!(texts(&m.session), 1, "and Bo's text reaches Asha");
+        assert!(doc(&m.session).refedit.is_none());
+    }
 }

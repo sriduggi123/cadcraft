@@ -1,0 +1,6 @@
+# Caddy site for the CADCraft cloud: HTTPS (certificate by Let's Encrypt) and WebSockets (wss://)
+# in front of the server on localhost. Imported from /etc/caddy/Caddyfile.
+cad.dotai.co.in {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:9010
+}

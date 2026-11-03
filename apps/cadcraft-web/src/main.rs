@@ -213,7 +213,7 @@ mod web {
                         // Opened from a session server at `/s/<name>`: join that session there.
                         if let Some(url) = web_session_url() {
                             let name = query_param("name").unwrap_or_else(|| "Web user".into());
-                            if let Err(e) = app.run("collab.join", serde_json::json!({"url": url, "name": name, "host": true})) {
+                            if let Err(e) = app.run("collab.join", serde_json::json!({"url": url, "name": name})) {
                                 log::error!("could not join {url}: {e}");
                             }
                         }

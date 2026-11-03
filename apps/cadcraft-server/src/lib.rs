@@ -1,11 +1,14 @@
-//! The CADCraft session server: shared drawing sessions over WebSockets. A client connects to
-//! `/s/<session>`; the first to join a session brings its drawing, later ones receive it. Each
-//! session's [`Server`] state machine orders the batches; this crate moves bytes, serves the web
-//! app and DWG/DXF downloads on the same port (`http.rs`), and keeps sessions on disk.
+//! The CADCraft session server: cloud files edited together over WebSockets. A client makes a
+//! file on `/new` with its drawing; the server names it with 128 random bits, and its link
+//! (`/s/<id>`) is the key to it: joining needs an existing id, and nothing lists the files
+//! (`/status` answers only about ids it is given). Each file's [`Server`] state machine orders
+//! the batches; this crate moves bytes, serves the web app and DWG/DXF downloads on the same port
+//! (`http.rs`), and keeps the files on disk.
 //!
-//! With a data folder, each session's drawing is written there ([`SAVE_EVERY`] at most, and when
-//! the last person leaves) and a session reopens from it. No accounts and no TLS yet (run it
-//! behind a TLS-terminating proxy for `wss://`); accounts are P6 of `plan/multiplayer-design.md`.
+//! With a data folder, each file's drawing is written there (when made, [`SAVE_EVERY`] at most
+//! while edited, and when the last person leaves) with its title beside it, and reopens from it.
+//! No accounts and no TLS (run it behind a TLS-terminating proxy for `wss://`); accounts are P6 of
+//! `plan/multiplayer-design.md`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -34,6 +37,8 @@ pub const MAX_SESSIONS: usize = 1000;
 pub const MAX_PEOPLE: usize = 64;
 /// How often changed sessions are written to the data folder.
 pub const SAVE_EVERY: Duration = Duration::from_secs(2);
+/// Most files one status question asks about.
+pub const MAX_STATUS: usize = 500;
 /// How long a read waits before the connection's thread sends what is queued.
 const POLL: Duration = Duration::from_millis(15);
 
@@ -72,34 +77,45 @@ impl Rooms {
         (rooms.len(), rooms.values().map(|r| r.conns.len()).sum())
     }
 
-    /// The cloud files: the sessions saved in the data folder and the live ones, newest first,
-    /// with who has each open.
-    pub fn files(&self) -> Vec<FileInfo> {
-        let mut files: HashMap<String, FileInfo> = HashMap::new();
-        if let Some(entries) = self.config.data.as_ref().and_then(|d| std::fs::read_dir(d).ok()) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(stem) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".cadsession")) else { continue };
-                let Some(name) = session_name(&format!("/s/{stem}")) else { continue };
-                let modified = entry.metadata().and_then(|m| m.modified()).map(seconds).unwrap_or(0);
-                files.insert(name.clone(), FileInfo { name, modified, people: Vec::new() });
-            }
+    /// How the files with these ids are doing (the ones that exist; at most [`MAX_STATUS`]).
+    /// Only ids the asker already knows are answered: nobody can list the server's files.
+    pub fn status(&self, ids: &[String]) -> Vec<FileInfo> {
+        let mut out = Vec::new();
+        for id in ids.iter().take(MAX_STATUS) {
+            let Some(name) = session_name(&format!("/s/{id}")) else { continue };
+            let live =
+                self.lock().get(&name).map(|r| (r.server.title().to_string(), r.server.peers().into_iter().map(|p| p.name).collect::<Vec<_>>()));
+            let saved = self.file(&name).and_then(|p| p.metadata().ok()).and_then(|m| m.modified().ok()).map(seconds);
+            let (title, people) = match (live, saved) {
+                (Some(l), _) => l,
+                (None, Some(_)) => (self.saved_title(&name), Vec::new()),
+                (None, None) => continue,
+            };
+            let modified = if people.is_empty() { saved.unwrap_or(0) } else { seconds(std::time::SystemTime::now()) };
+            out.push(FileInfo { name, title, modified, people });
         }
-        for (name, room) in self.lock().iter() {
-            let f = files.entry(name.clone()).or_insert_with(|| FileInfo { name: name.clone(), modified: 0, people: Vec::new() });
-            f.people = room.server.peers().into_iter().map(|p| p.name).collect();
-            if room.saved != Some(room.server.seq()) {
-                f.modified = seconds(std::time::SystemTime::now());
-            }
-        }
-        let mut files: Vec<FileInfo> = files.into_values().collect();
-        files.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
-        files
+        out
     }
 
     /// Whether a cloud file `name` exists, live or saved.
     fn exists(&self, name: &str) -> bool {
         self.lock().contains_key(name) || self.file(name).is_some_and(|p| p.exists())
+    }
+
+    /// The title saved next to file `name`'s drawing.
+    fn saved_title(&self, name: &str) -> String {
+        let path = self.config.data.as_ref().map(|d| d.join(format!("{name}.title")));
+        path.and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().chars().take(cadcraft_collab::server::MAX_TITLE).collect())
+            .unwrap_or_default()
+    }
+
+    fn save_title(&self, name: &str, title: &str) {
+        if let Some(d) = &self.config.data
+            && let Err(e) = std::fs::write(d.join(format!("{name}.title")), title)
+        {
+            eprintln!("file {name}: title not saved: {e}");
+        }
     }
 
     /// The session's file in the data folder.
@@ -241,8 +257,11 @@ fn connection(mut stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
     }
     let mut name = None;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES)).max_frame_size(Some(MAX_MESSAGE_BYTES));
-    // `/files` is the file list (named "" here: no session has that name).
-    let callback = |req: &Request, resp: Response| match session_name(req.uri().path()).or_else(|| (req.uri().path() == "/files").then(String::new)) {
+    // `/new` makes a cloud file and `/status` answers about files by id; neither is a name a file
+    // can have.
+    let callback = |req: &Request, resp: Response| match session_name(req.uri().path())
+        .or_else(|| matches!(req.uri().path(), NEW | STATUS).then(|| req.uri().path().to_string()))
+    {
         Some(n) => {
             name = Some(n);
             Ok(resp)
@@ -251,11 +270,11 @@ fn connection(mut stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
     };
     let replay = Replay { head, pos: 0, inner: stream };
     let mut ws = tungstenite::accept_hdr_with_config(replay, callback, Some(config)).map_err(|e| e.to_string())?;
-    let name = name.ok_or("no session name")?;
+    let mut name = name.ok_or("no session name")?;
     ws.get_mut().inner.set_read_timeout(Some(POLL)).map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel();
     let mut client = None;
-    let result = pump(&mut ws, &rx, |msg| handle(rooms, &name, &mut client, &tx, msg));
+    let result = pump(&mut ws, &rx, |msg| handle(rooms, &mut name, &mut client, &tx, msg));
     if let Some(id) = client {
         let mut all = rooms.lock();
         if let Some(room) = all.get_mut(&name) {
@@ -309,19 +328,69 @@ fn pump(ws: &mut WebSocket<Replay>, rx: &Receiver<Vec<u8>>, mut on: impl FnMut(C
     }
 }
 
-fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u8>>, msg: ClientMsg) -> Result<(), String> {
+/// The path that makes a new cloud file, and the one answering about files by id.
+const NEW: &str = "/new";
+const STATUS: &str = "/status";
+
+/// A new file id: 128 random bits as 22 URL-safe characters. The link is the key to the file.
+fn new_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| format!("no random numbers: {e}"))?;
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut bits = u128::from_le_bytes(bytes);
+    let mut id = String::with_capacity(22);
+    for _ in 0..22 {
+        id.push(char::from(ABC[(bits & 63) as usize]));
+        bits >>= 6;
+    }
+    Ok(id)
+}
+
+fn handle(rooms: &Rooms, name: &mut String, client: &mut Option<u32>, tx: &Sender<Vec<u8>>, msg: ClientMsg) -> Result<(), String> {
     match (msg, *client) {
-        (ClientMsg::List, None) if name.is_empty() => {
-            if let Ok(bytes) = message::encode(&ServerMsg::Files { files: rooms.files() }) {
+        (ClientMsg::List { files }, None) if name == STATUS => {
+            if let Ok(bytes) = message::encode(&ServerMsg::Files { files: rooms.status(&files) }) {
                 let _ = tx.send(bytes);
             }
             Ok(())
         }
-        (ClientMsg::Hello { .. }, None) if name.is_empty() => refuse(tx, "join a file at /s/<name>"),
-        (ClientMsg::Hello { create: true, .. }, None) if rooms.exists(name) => refuse(tx, &format!("a cloud file named {name} already exists")),
-        (ClientMsg::Hello { name: who, seed, resume, .. }, None) => {
+        (ClientMsg::Hello { .. }, None) if name == STATUS => refuse(tx, "open a file by its link"),
+        (ClientMsg::Hello { name: who, seed, title, .. }, None) if name == NEW => {
+            let Some(seed) = seed else { return refuse(tx, "a new file needs a drawing") };
+            let id = new_id()?;
+            let title: String = title.unwrap_or_default().trim().chars().take(cadcraft_collab::server::MAX_TITLE).collect();
+            let mut all = rooms.lock();
+            if all.len() >= MAX_SESSIONS {
+                return refuse(tx, "the server is full");
+            }
+            let mut server = Server::new(None);
+            server.set_file(&id, &title);
+            let (client_id, out) = match server.join(&who, Some(&seed), None) {
+                Ok(j) => j,
+                Err(e) => return refuse(tx, &e.to_string()),
+            };
+            let mut room = Room { server, conns: HashMap::new(), saved: None };
+            room.conns.insert(client_id, tx.clone());
+            route(&room, out);
+            let first = room.server.drawing().cloned();
+            all.insert(id.clone(), room);
+            drop(all);
+            // On disk at once, so the link works even if the server stops in the next seconds.
+            rooms.save_title(&id, &title);
+            if let Some(d) = first {
+                rooms.save(&id, &d);
+            }
+            *client = Some(client_id);
+            eprintln!("file {id} ({title}) made by {who}");
+            *name = id;
+            Ok(())
+        }
+        (ClientMsg::Hello { name: who, resume, .. }, None) => {
+            if !rooms.exists(name) {
+                return refuse(tx, "there is no file with this link (check it was copied whole)");
+            }
             // Read a saved session before taking the lock; it is used only if the room is new.
-            let saved = if rooms.lock().contains_key(name) {
+            let saved = if rooms.lock().contains_key(name.as_str()) {
                 None
             } else {
                 match rooms.load(name) {
@@ -329,44 +398,47 @@ fn handle(rooms: &Rooms, name: &str, client: &mut Option<u32>, tx: &Sender<Vec<u
                     Err(e) => return refuse(tx, &e),
                 }
             };
+            let title = rooms.saved_title(name);
             let mut all = rooms.lock();
-            if !all.contains_key(name) && all.len() >= MAX_SESSIONS {
+            if !all.contains_key(name.as_str()) && all.len() >= MAX_SESSIONS {
                 return refuse(tx, "the server is full");
             }
             let room = all.entry(name.to_string()).or_insert_with(|| {
                 let saved_seq = saved.is_some().then_some(0);
-                Room { server: Server::new(saved), conns: HashMap::new(), saved: saved_seq }
+                let mut server = Server::new(saved);
+                server.set_file(name, &title);
+                Room { server, conns: HashMap::new(), saved: saved_seq }
             });
             if room.conns.len() >= MAX_PEOPLE {
                 return refuse(tx, "the session is full");
             }
-            let (id, out) = match room.server.join(&who, seed.as_deref(), resume) {
+            let (id, out) = match room.server.join(&who, None, resume) {
                 Ok(j) => j,
                 Err(e) => return refuse(tx, &e.to_string()),
             };
             room.conns.insert(id, tx.clone());
             *client = Some(id);
-            eprintln!("session {name}: {who} joined as client {id}");
+            eprintln!("file {name}: {who} joined as client {id}");
             route(room, out);
             Ok(())
         }
         (ClientMsg::Batch { batch, base, changes }, Some(id)) => {
             let mut all = rooms.lock();
-            let room = all.get_mut(name).ok_or("the session is gone")?;
+            let room = all.get_mut(name.as_str()).ok_or("the session is gone")?;
             let out = room.server.batch(id, batch, base, changes);
             route(room, out);
             Ok(())
         }
         (ClientMsg::Lock { block, on }, Some(id)) => {
             let mut all = rooms.lock();
-            let room = all.get_mut(name).ok_or("the session is gone")?;
+            let room = all.get_mut(name.as_str()).ok_or("the session is gone")?;
             let out = room.server.lock(id, &block, on);
             route(room, out);
             Ok(())
         }
         (ClientMsg::Presence(p), Some(id)) => {
             let mut all = rooms.lock();
-            let room = all.get_mut(name).ok_or("the session is gone")?;
+            let room = all.get_mut(name.as_str()).ok_or("the session is gone")?;
             let out = room.server.presence(id, p);
             route(room, out);
             Ok(())

@@ -1,4 +1,4 @@
-//! The plain HTTP side of the server's port: the list of cloud files (`/`), the web app's files
+//! The plain HTTP side of the server's port: a front page (`/`, listing nothing), the web app's files
 //! (so a link `http://host/s/<session>` opens CADCraft in the browser, joined to that session) and
 //! the session's drawing as DWG or DXF (`/s/<session>.dwg`, handles renumbered to fit DWG).
 
@@ -42,7 +42,7 @@ pub(crate) fn is_websocket(head: &[u8]) -> bool {
 /// What a page request gets.
 #[derive(Debug, PartialEq)]
 pub enum Route {
-    /// The page listing the cloud files.
+    /// The front page (it lists nothing: files open by their links).
     List,
     /// The web app's page.
     App,
@@ -102,7 +102,7 @@ pub(crate) fn respond(stream: &mut TcpStream, head: &[u8], rooms: &Rooms) -> std
         return send(stream, "405 Method Not Allowed", "text/plain", &[], b"GET only\n");
     }
     match route(path) {
-        Route::List => send(stream, "200 OK", "text/html; charset=utf-8", &["Cache-Control: no-cache"], list_page(rooms).as_bytes()),
+        Route::List => send(stream, "200 OK", "text/html; charset=utf-8", &["Cache-Control: no-cache"], home_page().as_bytes()),
         Route::Export { name, dxf } => {
             let file = format!("{name}.{}", if dxf { "dxf" } else { "dwg" });
             let drawing = match rooms.drawing(&name) {
@@ -133,28 +133,12 @@ pub(crate) fn respond(stream: &mut TcpStream, head: &[u8], rooms: &Rooms) -> std
     }
 }
 
-/// The cloud files as a page: open each in the browser, or download it.
-fn list_page(rooms: &Rooms) -> String {
-    let web = rooms.config.web.is_some();
-    let mut rows = String::new();
-    for f in rooms.files() {
-        // Names are letters, digits, `-` and `_` only, so they need no escaping.
-        let open = if web { format!("<a href=\"/s/{0}\">{0}</a>", f.name) } else { f.name.clone() };
-        let people = if f.people.is_empty() { String::new() } else { format!("{} editing", f.people.len()) };
-        rows.push_str(&format!(
-            "<tr><td>{open}</td><td>{people}</td><td><a href=\"/s/{0}.dwg\">DWG</a> · <a href=\"/s/{0}.dxf\">DXF</a></td></tr>\n",
-            f.name
-        ));
-    }
-    if rows.is_empty() {
-        rows.push_str("<tr><td colspan=\"3\">No files yet. Save one from CADCraft: File ▸ Save to Cloud…</td></tr>\n");
-    }
-    format!(
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Cloud Files</title>\n\
-<style>:root{{color-scheme:light dark}}body{{font:15px system-ui,sans-serif;margin:24px 16px;max-width:720px}}\
-table{{border-collapse:collapse;width:100%}}td{{padding:8px 6px;border-bottom:1px solid #8884}}</style>\n\
-<h1>Cloud Files</h1>\n<table>\n{rows}</table>\n"
-    )
+/// The front page: what this server is. It lists nothing; a file opens only by its link.
+fn home_page() -> String {
+    "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>CADCraft Cloud</title>\n\
+<style>:root{color-scheme:light dark}body{font:15px system-ui,sans-serif;margin:24px 16px;max-width:720px}</style>\n\
+<h1>CADCraft Cloud</h1>\n<p>Open a shared drawing with its link. To share one, open it in CADCraft and choose File ▸ Collaborate….</p>\n"
+        .to_string()
 }
 
 fn send(stream: &mut TcpStream, status: &str, kind: &str, extra: &[&str], body: &[u8]) -> std::io::Result<()> {

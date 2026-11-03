@@ -1,28 +1,47 @@
-//! Cloud files (the fork's multiplayer work): File ▸ Open from Cloud… and Save to Cloud… open
-//! one dialog listing the server's files and who has each open; the status bar names the cloud
-//! file of the active tab and how many people are in it. The work is the engine's `cloud.list`,
-//! `cloud.open` and `cloud.save` commands; this module only shows them. What waits on the network
-//! (the list, connecting) runs on a background thread, so the window never stops responding.
+//! Cloud files (the fork's multiplayer work). File ▸ Collaborate… puts the open drawing on the
+//! server and shows its link; File ▸ Open Link… opens one in a new tab. A link is the key to its
+//! file: the server lists nothing, so "My cloud files" is this app's own list of the files it
+//! made or opened, kept with the preferences. The status bar names the shared tab's file and who
+//! is in it; other people's cursors, selections and rubber bands are drawn over the canvas. The
+//! work is the engine's `cloud.*` commands; what waits on the network runs on a background thread
+//! (or, in the browser, across frames), so the window never stops responding.
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use cadcraft_engine::cmd::collab::{self as cloud, CloudJoin};
 use cadcraft_geom::Vec2;
 use egui::{Color32, Rect, Sense, Shape, Stroke, pos2, vec2};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::CadApp;
 use crate::theme::Tokens;
 
-/// The dialog's state; the server address and name are kept with the preferences.
+/// Most files kept in "My cloud files".
+const MAX_RECENT: usize = 200;
+
+/// A file in "My cloud files".
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Recent {
+    pub link: String,
+    pub title: String,
+    /// When this app last opened it, in seconds since 1970.
+    pub opened: u64,
+}
+
+/// The dialog's state; the server address, name and file list are kept with the preferences.
 #[derive(Default)]
 pub struct State {
     pub open: bool,
     pub server: String,
     pub user: String,
-    save_name: String,
-    files: Vec<Value>,
+    pub recent: Vec<Recent>,
+    share_title: String,
+    link_input: String,
+    /// Who is in each of my files, by link, from the last status question.
+    people: std::collections::BTreeMap<String, Vec<String>>,
     error: Option<String>,
+    notice: Option<String>,
     busy: Option<Busy>,
     /// The cursor over the drawing, in drawing coordinates (set by the canvas), sent as presence.
     pub cursor: Option<Vec2>,
@@ -31,26 +50,30 @@ pub struct State {
 /// Network work in progress.
 enum Busy {
     #[cfg(not(target_arch = "wasm32"))]
-    List(Receiver<Result<Vec<Value>, String>>),
-    /// The browser asks for the list over its WebSocket and reads the answer on a later frame.
-    #[cfg(target_arch = "wasm32")]
-    Listing {
-        link: Box<dyn cadcraft_engine::collab::Link>,
-        since: f64,
-    },
+    Status(Receiver<Result<Vec<Value>, String>>),
     Connect {
         how: CloudJoin,
-        name: String,
         url: String,
         user: String,
+        title: String,
         link: Receiver<Result<Box<dyn cadcraft_engine::collab::Link>, String>>,
     },
     /// Connected; waiting for the server's welcome (it arrives through `collab_tick`).
     Join {
         how: CloudJoin,
-        name: String,
         since: f64,
     },
+}
+
+impl Busy {
+    /// Sharing or opening a file (not just asking who is in my files).
+    fn joining(&self) -> Option<CloudJoin> {
+        match self {
+            Busy::Connect { how, .. } | Busy::Join { how, .. } => Some(*how),
+            #[cfg(not(target_arch = "wasm32"))]
+            Busy::Status(_) => None,
+        }
+    }
 }
 
 /// How long the welcome may take once connected.
@@ -75,28 +98,50 @@ fn background<T>(f: impl FnOnce() -> T) -> Receiver<T> {
 }
 
 enum Action {
-    Refresh,
+    Share(String),
     Open(String),
-    Save(String),
+    Forget(String),
+    Stop,
 }
 
-/// `ui.cloud` and `ui.cloud.save`: open the dialog with a fresh list.
+/// Keep the dialog's settings and file list in the preferences.
+pub fn save_prefs(st: &State, prefs: &mut Value) {
+    if !st.server.is_empty() {
+        prefs["cloudServer"] = json!(st.server);
+    }
+    if !st.user.is_empty() {
+        prefs["cloudUser"] = json!(st.user);
+    }
+    if !st.recent.is_empty() {
+        prefs["cloudRecent"] = json!(st.recent);
+    }
+}
+
+pub fn load_prefs(st: &mut State, v: &Value) {
+    if let Some(server) = v.get("cloudServer").and_then(Value::as_str) {
+        st.server = server.to_string();
+    }
+    if let Some(user) = v.get("cloudUser").and_then(Value::as_str) {
+        st.user = user.to_string();
+    }
+    if let Some(r) = v.get("cloudRecent").and_then(|r| serde_json::from_value::<Vec<Recent>>(r.clone()).ok()) {
+        st.recent = r.into_iter().take(MAX_RECENT).collect();
+    }
+}
+
+/// `ui.cloud` (Open Link…) and `ui.cloud.share` (Collaborate…): open the dialog.
 pub fn route(app: &mut CadApp, id: &str, _params: &Value) -> Option<Result<Value, String>> {
-    if !matches!(id, "ui.cloud" | "ui.cloud.save") {
+    if !matches!(id, "ui.cloud" | "ui.cloud.share") {
         return None;
     }
     app.cloud.open = true;
-    if id == "ui.cloud.save" && app.cloud.save_name.is_empty() {
-        app.cloud.save_name = app.session.state().map(|st| suggested_name(&st.title)).unwrap_or_default();
+    app.cloud.error = None;
+    app.cloud.notice = None;
+    if app.cloud.share_title.is_empty() || id == "ui.cloud.share" {
+        app.cloud.share_title = cloud::default_title(&app.session);
     }
     refresh(app);
     Some(Ok(Value::Null))
-}
-
-/// A cloud file name from a tab title: `Floor plan.dwg` → `Floor-plan`.
-fn suggested_name(title: &str) -> String {
-    let stem = title.rsplit_once('.').map_or(title, |(s, _)| s);
-    stem.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' }).take(64).collect()
 }
 
 fn params(app: &CadApp) -> Value {
@@ -110,88 +155,94 @@ fn params(app: &CadApp) -> Value {
     p
 }
 
+/// Ask who is in my files (natively, in the background; the browser shows the list without it).
 fn refresh(app: &mut CadApp) {
-    let server = cloud::cloud_server(&params(app));
-    app.cloud.error = None;
     #[cfg(not(target_arch = "wasm32"))]
     {
-        app.cloud.busy = Some(Busy::List(background(move || cloud::list_files(&server).map_err(|e| e.to_string()))));
+        if app.cloud.busy.is_none() && !app.cloud.recent.is_empty() {
+            let links: Vec<String> = app.cloud.recent.iter().map(|r| r.link.clone()).collect();
+            app.cloud.busy = Some(Busy::Status(background(move || cloud::file_status(&links).map_err(|e| e.to_string()))));
+        }
     }
     #[cfg(target_arch = "wasm32")]
-    {
-        match cloud::list_start(&server) {
-            Ok(link) => app.cloud.busy = Some(Busy::Listing { link, since: crate::now_ms() / 1000.0 }),
-            Err(e) => app.cloud.error = Some(e.to_string()),
-        }
-    }
+    let _ = app;
 }
 
-/// The browser's list: the answer, an error, or still waiting.
-#[cfg(target_arch = "wasm32")]
-fn poll_listing(app: &mut CadApp, mut link: Box<dyn cadcraft_engine::collab::Link>, since: f64, now: f64) -> Option<Busy> {
-    let result = match cloud::list_poll(link.as_mut()) {
-        Some(r) => r.map_err(|e| e.to_string()),
-        None if now - since > 10.0 => Err("the server did not answer in time".into()),
-        None => return Some(Busy::Listing { link, since }),
-    };
-    match result {
-        Ok(files) => app.cloud.files = files,
-        Err(e) => {
-            app.cloud.files.clear();
-            app.cloud.error = Some(e);
-        }
-    }
-    None
+/// Open a cloud file's link (from the command line, say), with the dialog showing progress.
+pub fn open_link(app: &mut CadApp, link: &str) {
+    app.cloud.open = true;
+    start(app, CloudJoin::Open, link);
 }
 
-/// Open or save `name` in the background.
-fn start(app: &mut CadApp, how: CloudJoin, name: String) {
+/// Share the active drawing as `target` (its title), or open link `target`, in the background.
+fn start(app: &mut CadApp, how: CloudJoin, target: &str) {
     let p = params(app);
-    let url = cloud::cloud_file_url(&cloud::cloud_server(&p), &name);
-    if let Err(e) = cloud::check_cloud_name(&name) {
-        app.cloud.error = Some(e.to_string());
-        return;
-    }
+    let (url, title) = match how {
+        CloudJoin::Share => (format!("{}/new", cloud::cloud_server(&p)), target.trim().to_string()),
+        CloudJoin::Open => match cloud::parse_link(target) {
+            Ok((url, _)) => (url, String::new()),
+            Err(e) => {
+                app.cloud.error = Some(e.to_string());
+                return;
+            }
+        },
+    };
     // Already in that file: switching to its tab needs no network.
     if how == CloudJoin::Open && app.session.collab_url() == Some(url.as_str()) {
-        let mut p = p;
-        p["name"] = json!(name);
-        let _ = app.run("cloud.open", p);
+        let _ = app.run("cloud.open", json!({ "link": target }));
         app.cloud.open = false;
         return;
     }
     let user = cloud::cloud_user(&p);
-    let target = url.clone();
+    let to = url.clone();
     app.cloud.error = None;
-    app.cloud.busy = Some(Busy::Connect { how, name, url, user, link: background(move || cloud::cloud_connect(&target).map_err(|e| e.to_string())) });
+    app.cloud.notice = None;
+    app.cloud.busy = Some(Busy::Connect { how, url, user, title, link: background(move || cloud::cloud_connect(&to).map_err(|e| e.to_string())) });
 }
 
-/// Move the network work along; called every frame, with the dialog open or not.
+/// Put the shared tab's file at the top of "My cloud files".
+fn remember(app: &mut CadApp) {
+    let (Some(link), Some(title)) = (cloud::current_link(&app.session), app.session.collab_title().map(str::to_string)) else { return };
+    let st = &mut app.cloud;
+    if st.recent.first().is_some_and(|r| r.link == link && r.title == title) {
+        return;
+    }
+    st.recent.retain(|r| r.link != link);
+    st.recent.insert(0, Recent { link, title, opened: now_secs() });
+    st.recent.truncate(MAX_RECENT);
+}
+
+fn now_secs() -> u64 {
+    web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Move the network work along and send presence; called every frame, with the dialog open or not.
 pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
     app.session.collab_presence(app.cloud.cursor, ctx.input(|i| i.time));
+    remember(app);
     let Some(busy) = app.cloud.busy.take() else { return };
     ctx.request_repaint_after(std::time::Duration::from_millis(50));
     let now = ctx.input(|i| i.time);
     app.cloud.busy = match busy {
-        #[cfg(target_arch = "wasm32")]
-        Busy::Listing { link, since } => poll_listing(app, link, since, crate::now_ms() / 1000.0),
         #[cfg(not(target_arch = "wasm32"))]
-        Busy::List(rx) => match rx.try_recv() {
+        Busy::Status(rx) => match rx.try_recv() {
             Ok(Ok(files)) => {
-                app.cloud.files = files;
+                app.cloud.people = files
+                    .iter()
+                    .filter_map(|f| {
+                        let link = f.get("link")?.as_str()?.to_string();
+                        let people = f.get("people")?.as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                        Some((link, people))
+                    })
+                    .collect();
                 None
             }
-            Ok(Err(e)) => {
-                app.cloud.files.clear();
-                app.cloud.error = Some(e);
-                None
-            }
-            Err(TryRecvError::Empty) => Some(Busy::List(rx)),
-            Err(TryRecvError::Disconnected) => None,
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => Some(Busy::Status(rx)),
         },
-        Busy::Connect { how, name, url, user, link } => match link.try_recv() {
-            Ok(Ok(link)) => match cloud::cloud_begin(&mut app.session, how, link, &url, &name, &user) {
-                Ok(()) => Some(Busy::Join { how, name, since: now }),
+        Busy::Connect { how, url, user, title, link } => match link.try_recv() {
+            Ok(Ok(link)) => match cloud::cloud_begin(&mut app.session, how, link, &url, &user, &title) {
+                Ok(()) => Some(Busy::Join { how, since: now }),
                 Err(e) => {
                     app.cloud.error = Some(e.to_string());
                     None
@@ -201,14 +252,16 @@ pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
                 app.cloud.error = Some(e);
                 None
             }
-            Err(TryRecvError::Empty) => Some(Busy::Connect { how, name, url, user, link }),
+            Err(TryRecvError::Empty) => Some(Busy::Connect { how, url, user, title, link }),
             Err(TryRecvError::Disconnected) => None,
         },
-        Busy::Join { how, name, since } => {
-            if app.session.collab_joined() {
-                cloud::cloud_joined(&mut app.session, how, &name);
-                app.cloud.open = false;
+        Busy::Join { how, since } => {
+            if app.session.collab_joined() && cloud::current_link(&app.session).is_some() {
+                cloud::cloud_joined(&mut app.session, how);
                 app.canvas.list = None;
+                remember(app);
+                // After sharing, the dialog stays open on the link to copy.
+                app.cloud.open = how == CloudJoin::Share;
                 None
             } else if let Some(why) = app.session.collab_ended() {
                 app.cloud.error = Some(format!("could not join: {why}"));
@@ -220,16 +273,15 @@ pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
                 app.cloud.open = true;
                 None
             } else {
-                Some(Busy::Join { how, name, since })
+                Some(Busy::Join { how, since })
             }
         }
     };
 }
 
 /// "3 min ago" for a time in seconds since 1970.
-fn ago(modified: u64) -> String {
-    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    match now.saturating_sub(modified) {
+fn ago(t: u64) -> String {
+    match now_secs().saturating_sub(t) {
         0..60 => crate::tl!("just now").to_string(),
         s @ 60..3600 => format!("{} min ago", s / 60),
         s @ 3600..86_400 => format!("{} h ago", s / 3600),
@@ -243,6 +295,8 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
         return;
     }
     let shared = app.session.collab_live();
+    let link = cloud::current_link(&app.session);
+    let title = app.session.collab_title().unwrap_or_default().to_string();
     let has_doc = app.session.state().is_ok();
     let others = app.session.collab_others();
     let following = app.session.collab_following();
@@ -250,60 +304,53 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     let mut open = true;
     let mut action = None;
     let st = &mut app.cloud;
-    egui::Window::new(crate::tl!("Cloud Files")).open(&mut open).collapsible(false).default_width(460.0).show(ctx, |ui| {
-        egui::Grid::new("cloud_conn").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label(crate::tl!("Server"));
-            ui.add(egui::TextEdit::singleline(&mut st.server).hint_text("ws://127.0.0.1:9010").desired_width(300.0));
-            ui.end_row();
-            ui.label(crate::tl!("Your name"));
-            ui.add(egui::TextEdit::singleline(&mut st.user).desired_width(300.0));
-            ui.end_row();
-        });
-        ui.horizontal(|ui| {
-            if ui.add_enabled(st.busy.is_none(), egui::Button::new(crate::tl!("Refresh"))).clicked() {
-                action = Some(Action::Refresh);
+    let joining = st.busy.as_ref().and_then(Busy::joining);
+    let idle = joining.is_none();
+    egui::Window::new(crate::tl!("Cloud Files")).open(&mut open).collapsible(false).default_width(520.0).show(ctx, |ui| {
+        // The shared drawing's link, or sharing the open one.
+        match &link {
+            Some(link) => {
+                ui.label(egui::RichText::new(format!("{} \u{201c}{title}\u{201d}", crate::tl!("Shared:"))).strong());
+                ui.horizontal(|ui| {
+                    let mut text = link.clone();
+                    ui.add(egui::TextEdit::singleline(&mut text).desired_width(360.0).font(egui::TextStyle::Monospace));
+                    if ui.button(crate::tl!("Copy Link")).clicked() {
+                        ui.ctx().copy_text(link.clone());
+                        st.notice = Some(crate::tl!("Link copied: anyone with it can open and edit this drawing.").to_string());
+                    }
+                    if ui
+                        .button(crate::tl!("Stop Sharing"))
+                        .on_hover_text(crate::tl!("This tab becomes a local copy; the file stays in the cloud"))
+                        .clicked()
+                    {
+                        action = Some(Action::Stop);
+                    }
+                });
             }
-            match &st.busy {
-                #[cfg(not(target_arch = "wasm32"))]
-                Some(Busy::List(_)) => {
-                    ui.spinner();
-                    ui.label(crate::tl!("Loading…"));
-                }
-                #[cfg(target_arch = "wasm32")]
-                Some(Busy::Listing { .. }) => {
-                    ui.spinner();
-                    ui.label(crate::tl!("Loading…"));
-                }
-                Some(Busy::Connect { name, .. } | Busy::Join { name, .. }) => {
-                    ui.spinner();
-                    ui.label(format!("{} {name}…", crate::tl!("Connecting to")));
-                }
-                None => {}
+            None => {
+                ui.label(egui::RichText::new(crate::tl!("Collaborate on the open drawing")).strong());
+                ui.horizontal(|ui| {
+                    ui.label(crate::tl!("Title"));
+                    ui.add(egui::TextEdit::singleline(&mut st.share_title).desired_width(260.0));
+                    let can = has_doc && !shared && idle && !st.share_title.trim().is_empty();
+                    if ui.add_enabled(can, egui::Button::new(crate::tl!("Collaborate"))).clicked() {
+                        action = Some(Action::Share(st.share_title.trim().to_string()));
+                    }
+                });
             }
-        });
+        }
+        if let Some(how) = joining {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if how == CloudJoin::Share { crate::tl!("Putting the drawing in the cloud…") } else { crate::tl!("Opening…") });
+            });
+        }
         if let Some(e) = &st.error {
             ui.colored_label(Tokens::get().warn, e);
         }
-        ui.separator();
-        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            if st.files.is_empty() && st.error.is_none() && st.busy.is_none() {
-                ui.label(crate::tl!("No files yet."));
-            }
-            egui::Grid::new("cloud_files").num_columns(4).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
-                for f in &st.files {
-                    let name = f.get("name").and_then(Value::as_str).unwrap_or_default();
-                    let people: Vec<&str> =
-                        f.get("people").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-                    ui.label(egui::RichText::new(name).strong());
-                    ui.label(if people.is_empty() { String::new() } else { format!("{} editing", people.join(", ")) });
-                    ui.label(ago(f.get("modified").and_then(Value::as_u64).unwrap_or(0)));
-                    if ui.add_enabled(st.busy.is_none(), egui::Button::new(crate::tl!("Open"))).clicked() {
-                        action = Some(Action::Open(name.to_string()));
-                    }
-                    ui.end_row();
-                }
-            });
-        });
+        if let Some(n) = &st.notice {
+            ui.label(n);
+        }
         if shared && !others.is_empty() {
             ui.separator();
             ui.label(egui::RichText::new(crate::tl!("People here")).strong());
@@ -326,15 +373,57 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
             });
         }
         ui.separator();
+        ui.label(egui::RichText::new(crate::tl!("Open a link")).strong());
         ui.horizontal(|ui| {
-            ui.label(crate::tl!("Save the current drawing as"));
-            ui.add(egui::TextEdit::singleline(&mut st.save_name).desired_width(160.0));
-            let can = has_doc && !shared && st.busy.is_none() && !st.save_name.trim().is_empty();
-            let resp = ui.add_enabled(can, egui::Button::new(crate::tl!("Save to Cloud")));
-            let resp = if shared { resp.on_disabled_hover_text(crate::tl!("This drawing is already in the cloud")) } else { resp };
-            if resp.clicked() {
-                action = Some(Action::Save(st.save_name.trim().to_string()));
+            let r = ui.add(egui::TextEdit::singleline(&mut st.link_input).hint_text("https://…/s/…").desired_width(400.0));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let can = idle && !st.link_input.trim().is_empty();
+            if ui.add_enabled(can, egui::Button::new(crate::tl!("Open"))).clicked() || (enter && can) {
+                action = Some(Action::Open(st.link_input.trim().to_string()));
             }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new(crate::tl!("My cloud files")).strong());
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            if st.recent.is_empty() {
+                ui.label(crate::tl!("Files you share or open appear here."));
+            }
+            egui::Grid::new("cloud_files").num_columns(4).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
+                for r in &st.recent {
+                    let name = if r.title.is_empty() { crate::tl!("(untitled)").to_string() } else { r.title.clone() };
+                    ui.label(egui::RichText::new(name).strong()).on_hover_text(&r.link);
+                    let people = st.people.get(&r.link).filter(|p| !p.is_empty()).map(|p| format!("{} editing", p.join(", "))).unwrap_or_default();
+                    ui.label(people);
+                    ui.label(ago(r.opened));
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(idle, egui::Button::new(crate::tl!("Open"))).clicked() {
+                            action = Some(Action::Open(r.link.clone()));
+                        }
+                        if ui.button(crate::tl!("Copy Link")).clicked() {
+                            ui.ctx().copy_text(r.link.clone());
+                        }
+                        if ui
+                            .small_button(crate::tl!("Remove"))
+                            .on_hover_text(crate::tl!("Remove from this list (the file stays in the cloud)"))
+                            .clicked()
+                        {
+                            action = Some(Action::Forget(r.link.clone()));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+        });
+        ui.separator();
+        egui::CollapsingHeader::new(crate::tl!("Settings")).show(ui, |ui| {
+            egui::Grid::new("cloud_conn").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label(crate::tl!("Server"));
+                ui.add(egui::TextEdit::singleline(&mut st.server).hint_text(cloud::DEFAULT_SERVER).desired_width(300.0));
+                ui.end_row();
+                ui.label(crate::tl!("Your name"));
+                ui.add(egui::TextEdit::singleline(&mut st.user).desired_width(300.0));
+                ui.end_row();
+            });
         });
     });
     app.cloud.open = open;
@@ -346,9 +435,12 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     }
     match action {
         None => {}
-        Some(Action::Refresh) => refresh(app),
-        Some(Action::Open(name)) => start(app, CloudJoin::Open, name),
-        Some(Action::Save(name)) => start(app, CloudJoin::Save, name),
+        Some(Action::Share(title)) => start(app, CloudJoin::Share, &title),
+        Some(Action::Open(link)) => start(app, CloudJoin::Open, &link),
+        Some(Action::Forget(link)) => app.cloud.recent.retain(|r| r.link != link),
+        Some(Action::Stop) => {
+            let _ = app.run("collab.leave", json!({}));
+        }
     }
 }
 
@@ -358,16 +450,20 @@ fn colour(client: u32) -> Color32 {
     p.get(client as usize % p.len()).copied().unwrap_or(Color32::GRAY)
 }
 
+fn layout_of(space: &cadcraft_doc::Space) -> String {
+    match space {
+        cadcraft_doc::Space::Model => String::new(),
+        cadcraft_doc::Space::Paper(n) => n.clone(),
+    }
+}
+
 /// The others' rubber bands on the shared tab, as objects in their colour.
 pub fn previews(app: &CadApp) -> Vec<Vec<cadcraft_doc::Entity>> {
     let Ok(st) = app.session.state() else { return Vec::new() };
     if app.session.collab_uid() != Some(st.uid) {
         return Vec::new();
     }
-    let layout = match &st.space {
-        cadcraft_doc::Space::Model => String::new(),
-        cadcraft_doc::Space::Paper(n) => n.clone(),
-    };
+    let layout = layout_of(&st.space);
     app.session
         .collab_others()
         .into_iter()
@@ -396,10 +492,7 @@ pub fn paint_presence(app: &CadApp, painter: &egui::Painter, xf: &crate::canvas:
     if app.session.collab_uid() != Some(st.uid) {
         return;
     }
-    let layout = match &st.space {
-        cadcraft_doc::Space::Model => String::new(),
-        cadcraft_doc::Space::Paper(n) => n.clone(),
-    };
+    let layout = layout_of(&st.space);
     let painter = painter.with_clip_rect(rect);
     let Some(shown) = st.doc.space(&st.space) else { return };
     for (peer, p) in app.session.collab_others().iter().filter(|(_, p)| p.layout == layout) {
@@ -435,15 +528,18 @@ pub fn paint_presence(app: &CadApp, painter: &egui::Painter, xf: &crate::canvas:
     }
 }
 
-/// The status bar's cloud label for the active tab ("Cloud: plan · 2 here"), right-aligned at
-/// `right`; clicking it opens the dialog. Returns the left edge for the next item.
+/// The status bar's cloud label for the active tab ("Cloud: Floor plan · 2 here"),
+/// right-aligned at `right`; clicking it opens the dialog with the link. Returns the left edge
+/// for the next item.
 pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
-    let Some(url) = app.session.collab_url() else { return right };
+    if app.session.collab_url().is_none() {
+        return right;
+    }
     let active = app.session.state().map(|st| st.uid).ok();
     if active.is_none() || active != app.session.collab_uid() {
         return right;
     }
-    let name = url.rsplit('/').next().unwrap_or_default().to_string();
+    let name = app.session.collab_title().filter(|t| !t.is_empty()).map_or_else(|| crate::tl!("shared drawing").to_string(), str::to_string);
     let people = app.session.collab_status().map_or(0, |(_, p, _)| p.len());
     let lead = app.session.collab_following().and_then(|c| app.session.collab_others().into_iter().find(|(p, _)| p.client == c)).map(|(p, _)| p.name);
     let text = match lead {
@@ -454,7 +550,7 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
     let t = Tokens::get();
     let p = ui.painter().clone();
     let g = p.layout_no_wrap(text, crate::theme::small(), t.text);
-    let w = g.size().x.min(220.0) + 12.0;
+    let w = g.size().x.min(260.0) + 12.0;
     let r = Rect::from_min_size(pos2(right - w, cy - 9.0), vec2(w, 18.0));
     let resp = ui.interact(r, ui.scope_id().with("cloud_status"), Sense::click());
     p.rect_filled(r, 3.0, if resp.hovered() { t.control_hover } else { t.toggle_on.gamma_multiply(0.25) });
@@ -469,12 +565,16 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::suggested_name;
+    use super::{Recent, State, load_prefs, save_prefs};
 
     #[test]
-    fn a_tab_title_suggests_a_cloud_name() {
-        assert_eq!(suggested_name("Floor plan.dwg"), "Floor-plan");
-        assert_eq!(suggested_name("Drawing1"), "Drawing1");
-        assert_eq!(suggested_name("a.b.dxf"), "a-b");
+    fn my_cloud_files_survive_a_restart() {
+        let mut st = State::default();
+        st.recent.push(Recent { link: "https://cad.example.com/s/Ab".into(), title: "Floor plan".into(), opened: 5 });
+        let mut prefs = serde_json::json!({});
+        save_prefs(&st, &mut prefs);
+        let mut back = State::default();
+        load_prefs(&mut back, &prefs);
+        assert_eq!(back.recent, st.recent);
     }
 }

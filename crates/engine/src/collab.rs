@@ -5,8 +5,10 @@
 //! a command never sees the drawing change under it.
 //!
 //! Undo in a session takes back only this person's steps ([`DocState::revert_in`]): swapping the
-//! drawing back would take back other people's edits too. The Block Editor locks its block on
-//! the server while open; REFEDIT, which edits a block in place in the drawing, is refused.
+//! drawing back would take back other people's edits too. The Block Editor and REFEDIT lock their
+//! block on the server while open. REFEDIT edits the block in place in the drawing, so while it
+//! lasts this person's changes and others' arriving edits wait; REFCLOSE sends the result and
+//! then applies what arrived.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -34,8 +36,8 @@ const RECONNECT_MAX_WAIT: Duration = Duration::from_secs(15);
 /// Least time between two presence messages, in seconds (20 a second at most).
 const PRESENCE_EVERY: f64 = 0.05;
 
-/// Commands that can't run in a shared session yet.
-const REFUSED: &[&str] = &["refedit"];
+/// Commands that can't run in a shared session (none at present).
+const REFUSED: &[&str] = &[];
 
 /// The live session of one drawing.
 pub struct Live {
@@ -60,6 +62,8 @@ pub struct Live {
     known: Option<Arc<Drawing>>,
     /// The block this person has locked for the Block Editor.
     locked: Option<String>,
+    /// The cloud file's title.
+    title: String,
     /// The name shown to others.
     name: String,
     /// The connection dropped and is being made again.
@@ -99,19 +103,21 @@ impl Session {
     /// drawing (ignored if the session already has one). The welcome arrives through
     /// [`Session::collab_tick`].
     pub fn collab_attach(&mut self, link: Box<dyn Link>, name: &str, host: bool) -> Result<()> {
-        self.collab_attach_to(link, "", name, host, false)
+        self.collab_attach_to(link, "", name, host.then_some(""))
     }
 
-    /// [`Session::collab_attach`] to the session at `url`; `create`: it must be a new file.
-    pub fn collab_attach_to(&mut self, link: Box<dyn Link>, url: &str, name: &str, host: bool, create: bool) -> Result<()> {
+    /// [`Session::collab_attach`] to the session at `url` (`…/s/<file>`, or `…/new` to make a
+    /// new cloud file). `new`: start it with the active drawing under this title.
+    pub fn collab_attach_to(&mut self, link: Box<dyn Link>, url: &str, name: &str, new: Option<&str>) -> Result<()> {
         if self.collab.as_ref().is_some_and(|l| l.ended.is_none()) {
             return Err(EngineError::Other("already in a shared session (collab.leave first)".into()));
         }
         let st = self.state()?;
-        let seed = if host { Some(snapshot::encode(&st.doc).map_err(|e| EngineError::Other(e.to_string()))?) } else { None };
+        let seed = if new.is_some() { Some(snapshot::encode(&st.doc).map_err(|e| EngineError::Other(e.to_string()))?) } else { None };
         let uid = st.uid;
         let mut link = link;
-        link.send(&ClientMsg::Hello { name: name.to_string(), seed, create, resume: None }).map_err(|e| EngineError::Other(e.to_string()))?;
+        let hello = ClientMsg::Hello { name: name.to_string(), seed, title: new.map(str::to_string), resume: None };
+        link.send(&hello).map_err(|e| EngineError::Other(e.to_string()))?;
         self.collab = Some(Live {
             link,
             uid,
@@ -124,11 +130,17 @@ impl Session {
             followed: None,
             known: None,
             locked: None,
+            title: String::new(),
             name: name.to_string(),
             retry: None,
             rejoining: false,
         });
         Ok(())
+    }
+
+    /// The cloud file's title, once joined.
+    pub fn collab_title(&self) -> Option<&str> {
+        self.collab.as_ref().filter(|l| l.ended.is_none() && l.client.is_some()).map(|l| l.title.as_str())
     }
 
     /// The address of the session attached, if one is.
@@ -167,6 +179,11 @@ impl Session {
         self.collab = None;
     }
 
+    /// Whether the shared drawing has a block open for editing in place (REFEDIT).
+    fn collab_editing_in_place(&self) -> bool {
+        self.collab.as_ref().is_some_and(|l| self.docs.iter().any(|d| d.uid == l.uid && d.doc.refedit.is_some()))
+    }
+
     /// Whether the active drawing is the shared one.
     pub(crate) fn collab_shares_active(&self) -> bool {
         self.collab_live() && self.state().is_ok_and(|st| self.collab.as_ref().is_some_and(|l| l.uid == st.uid))
@@ -194,6 +211,11 @@ impl Session {
             return self.collab_retry();
         }
         self.collab_sync_lock();
+        // Others' edits wait while a block is edited in place (they would rebuild the drawing
+        // under the working set); REFCLOSE lets them in.
+        if self.collab_editing_in_place() {
+            return;
+        }
         self.collab_drain();
         self.collab_follow_step();
     }
@@ -219,7 +241,7 @@ impl Session {
             if let Ok(link) = result {
                 let id = live.client.as_ref().map(Client::id);
                 live.link = link;
-                let hello = ClientMsg::Hello { name: live.name.clone(), seed: None, create: false, resume: id };
+                let hello = ClientMsg::Hello { name: live.name.clone(), seed: None, title: None, resume: id };
                 if live.link.send(&hello).is_ok() {
                     live.retry = None;
                     live.rejoining = true;
@@ -275,7 +297,7 @@ impl Session {
         if !pairs.is_empty() {
             fixed += crate::cmd::hatch::repair_associative(&mut d, suspect);
         }
-        fixed += repair_layers(&mut d, start, |name| client.renamed("layers", name).map(str::to_string));
+        fixed += repair_references(&mut d, start, |table, name| client.renamed(table, name).map(str::to_string));
         if fixed == 0 || Arc::ptr_eq(&d, &pre) {
             return;
         }
@@ -425,7 +447,30 @@ impl Session {
     fn collab_sync_lock(&mut self) {
         let Some(live) = self.collab.as_ref().filter(|l| l.client.is_some() && l.ended.is_none()) else { return };
         let uid = live.uid;
-        let open = self.docs.iter().find(|d| d.uid == uid).and_then(|d| d.block_editor()).map(str::to_string);
+        let open = self
+            .docs
+            .iter()
+            .find(|d| d.uid == uid)
+            .and_then(|d| d.block_editor().map(str::to_string).or_else(|| d.doc.refedit.as_ref().map(|r| r.block.clone())));
+        // Two people opened the same block at the same moment: the server gave it to the other.
+        if let (Some(mine), Some(c)) = (&live.locked, live.client.as_ref())
+            && let Some(h) = c.lock_holder(mine).filter(|h| *h != c.id())
+        {
+            let who = c.peers().iter().find(|p| p.client == h).map_or_else(|| "someone else".to_string(), |p| p.name.clone());
+            let msg = format!("{who} opened block {mine} a moment before you; it is theirs until they close it.");
+            if let Some(l) = self.collab.as_mut() {
+                l.locked = None;
+            }
+            if let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
+                && st.block_edit.is_some()
+            {
+                let _ = st.close_block_editor(false);
+            }
+            if self.collab_editing_in_place() {
+                let _ = self.execute("refclose", &serde_json::json!({"save": false}));
+            }
+            return self.echo(msg);
+        }
         if open.as_deref().map(str::to_lowercase) == live.locked.as_deref().map(str::to_lowercase) {
             return;
         }
@@ -437,7 +482,10 @@ impl Session {
         if let Some(name) = &open
             && let Some((_, who)) = holder(name)
         {
-            if let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid) {
+            let in_place = self.docs.iter().find(|d| d.uid == uid).is_some_and(|d| d.block_edit.is_none());
+            if in_place {
+                let _ = self.execute("refclose", &serde_json::json!({"save": false}));
+            } else if let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid) {
                 let _ = st.close_block_editor(false);
             }
             let who = who.unwrap_or_else(|| "someone else".into());
@@ -474,9 +522,19 @@ impl Session {
         };
         let mut rejoined = None;
         let view = match (&mut live.client, msg) {
-            (None, ServerMsg::Welcome { client, seq, snapshot }) => {
+            (None, ServerMsg::Welcome { client, seq, snapshot, file, title }) => {
                 let (c, view) = Client::welcome(client, seq, &snapshot).map_err(|e| e.to_string())?;
                 live.client = Some(c);
+                // A new file's address is known once the server named it.
+                if let Some(server) = live.url.strip_suffix("/new").map(str::to_string)
+                    && !file.is_empty()
+                {
+                    live.url = format!("{server}/s/{file}");
+                }
+                if !title.is_empty() {
+                    st.title = title.clone();
+                }
+                live.title = title;
                 // Snapshot undo can't work across other people's edits (per-user undo is P4).
                 st.undo.clear();
                 st.redo.clear();
@@ -484,7 +542,7 @@ impl Session {
             }
             (None, ServerMsg::Error { message }) => return Err(message),
             (None, _) => None,
-            (Some(_), ServerMsg::Welcome { client, seq, snapshot }) if live.rejoining => {
+            (Some(_), ServerMsg::Welcome { client, seq, snapshot, .. }) if live.rejoining => {
                 live.rejoining = false;
                 // The server let go of this person's block lock and presence when they dropped.
                 live.locked = None;
@@ -532,6 +590,11 @@ impl Session {
         if live.retry.is_some() || live.rejoining {
             return;
         }
+        // Inside REFEDIT nothing goes out until REFCLOSE, which sends the finished block.
+        if self.docs.iter().find(|d| d.uid == uid).is_some_and(|d| d.doc.refedit.is_some()) {
+            return;
+        }
+        let Some(live) = self.collab.as_mut().filter(|l| l.uid == uid && l.ended.is_none()) else { return };
         let Some(client) = live.client.as_mut() else { return };
         let before = live.known.clone().unwrap_or_else(|| before.clone());
         if Arc::ptr_eq(&before, &after) {
@@ -598,31 +661,74 @@ impl crate::DocState {
     }
 }
 
-/// Objects that edits since `before` left on a layer that doesn't exist (someone renamed or
-/// deleted it while another drew on it): onto the layer's new name when it was renamed, else
-/// the layer is made again with default settings. Returns how many objects or layers changed.
-fn repair_layers(d: &mut Arc<Drawing>, before: &Drawing, renamed: impl Fn(&str) -> Option<String>) -> usize {
-    let mut moves: Vec<(Handle, String)> = Vec::new();
+/// Objects that edits since `before` left pointing at a table entry that doesn't exist (someone
+/// renamed or deleted it while another used it): a layer, linetype, text style or dimension style
+/// that was renamed is followed to its new name. Otherwise a missing layer is made again with
+/// default settings, a linetype goes back to ByLayer and a style to Standard (when the drawing
+/// has it). `renamed(table, name)` gives a rename seen in the session. Returns how many objects
+/// or layers changed.
+fn repair_references(d: &mut Arc<Drawing>, before: &Drawing, renamed: impl Fn(&str, &str) -> Option<String>) -> usize {
+    use cadcraft_doc::EntityKind;
+    enum Fix {
+        Layer(String),
+        Linetype(String),
+        Style(String),
+    }
+    let follow = |table: &str, name: &str, exists: &dyn Fn(&str) -> bool| renamed(table, name).filter(|n| exists(n));
+    let mut fixes: Vec<(Handle, Fix)> = Vec::new();
     let mut make: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for store in std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)) {
-        for e in store.iter() {
-            let touched = before.entity(e.handle).is_none_or(|x| !Arc::ptr_eq(x, e));
-            if !touched || d.layer(&e.common.layer).is_some() {
-                continue;
-            }
-            match renamed(&e.common.layer).filter(|n| d.layer(n).is_some()) {
-                Some(to) => moves.push((e.handle, to)),
-                None => {
-                    make.insert(e.common.layer.clone());
+    {
+        let dr: &Drawing = d;
+        let layer_ok = |n: &str| dr.layer(n).is_some();
+        let linetype_ok =
+            |n: &str| n.is_empty() || ["bylayer", "byblock", "continuous"].contains(&n.to_ascii_lowercase().as_str()) || dr.linetype(n).is_some();
+        let text_ok = |n: &str| dr.text_style(n).is_some();
+        let dim_ok = |n: &str| dr.dim_style(n).is_some();
+        for store in std::iter::once(&dr.model).chain(dr.layouts.iter().map(|l| &l.entities)) {
+            for e in store.iter() {
+                if before.entity(e.handle).is_some_and(|x| Arc::ptr_eq(x, e)) {
+                    continue;
+                }
+                let c = &e.common;
+                if !layer_ok(&c.layer) {
+                    match follow("layers", &c.layer, &layer_ok) {
+                        Some(to) => fixes.push((e.handle, Fix::Layer(to))),
+                        None => {
+                            make.insert(c.layer.clone());
+                        }
+                    }
+                }
+                if !linetype_ok(&c.linetype) {
+                    fixes.push((e.handle, Fix::Linetype(follow("linetypes", &c.linetype, &linetype_ok).unwrap_or_else(|| "ByLayer".into()))));
+                }
+                let (style, table, ok): (Option<&String>, &str, &dyn Fn(&str) -> bool) = match &e.kind {
+                    EntityKind::Text(t) => (Some(&t.style), "text_styles", &text_ok),
+                    EntityKind::MText(t) => (Some(&t.style), "text_styles", &text_ok),
+                    EntityKind::Dimension(dm) => (Some(&dm.style), "dim_styles", &dim_ok),
+                    _ => (None, "", &text_ok),
+                };
+                if let Some(style) = style.filter(|s| !ok(s))
+                    && let Some(to) = follow(table, style, ok).or_else(|| ok("Standard").then(|| "Standard".to_string()))
+                {
+                    fixes.push((e.handle, Fix::Style(to)));
                 }
             }
         }
     }
-    let n = moves.len() + make.len();
+    let n = fixes.len() + make.len();
     if n > 0 {
         let d = Arc::make_mut(d);
-        for (h, to) in moves {
-            let _ = d.modify_entity(h, |e| e.common.layer = to);
+        for (h, fix) in fixes {
+            let _ = d.modify_entity(h, |e| match fix {
+                Fix::Layer(to) => e.common.layer = to,
+                Fix::Linetype(to) => e.common.linetype = to,
+                Fix::Style(to) => match &mut e.kind {
+                    EntityKind::Text(t) => t.style = to,
+                    EntityKind::MText(t) => t.style = to,
+                    EntityKind::Dimension(dm) => dm.style = to,
+                    _ => {}
+                },
+            });
         }
         d.layers.extend(make.iter().map(|name| cadcraft_doc::Layer::new(name)));
     }

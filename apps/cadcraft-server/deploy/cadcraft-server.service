@@ -1,0 +1,23 @@
+# CADCraft cloud file server. Runs as its own user, writes only /var/lib/cadcraft, and is capped
+# so it can never starve other services on the same box.
+[Unit]
+Description=CADCraft cloud file server
+After=network.target
+
+[Service]
+User=cadcraft
+Group=cadcraft
+ExecStart=/opt/cadcraft/cadcraft-server --listen 127.0.0.1:9010 --data /var/lib/cadcraft --web /opt/cadcraft/web
+Restart=on-failure
+RestartSec=2
+MemoryMax=1G
+CPUQuota=100%
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/cadcraft
+
+[Install]
+WantedBy=multi-user.target

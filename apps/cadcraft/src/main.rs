@@ -366,7 +366,11 @@ fn main() -> eframe::Result {
                 let _ = app.run("ui.sample", serde_json::json!({}));
             }
             for f in &files {
-                app.open_path(f);
+                // A cloud file's link (`https://host/s/<id>`) opens that file, shared.
+                match f.to_str().filter(|s| s.contains("://") && s.contains("/s/")) {
+                    Some(link) => cadcraft_ui_egui::cloud::open_link(&mut app, link),
+                    None => app.open_path(f),
+                }
             }
             if app.session.docs.is_empty() {
                 // In the units the profile asks for (MEASUREINIT, restored above).

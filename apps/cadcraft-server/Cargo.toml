@@ -22,6 +22,7 @@ cadcraft-collab = { workspace = true }
 cadcraft-doc = { workspace = true }
 cadcraft-io = { workspace = true }
 clap = { workspace = true }
+getrandom = "0.3"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]

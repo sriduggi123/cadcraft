@@ -483,24 +483,14 @@ impl CadApp {
         if let Some(dir) = &self.ui.last_lisp_dir {
             prefs["lispDir"] = json!(dir);
         }
-        if !self.cloud.server.is_empty() {
-            prefs["cloudServer"] = json!(self.cloud.server);
-        }
-        if !self.cloud.user.is_empty() {
-            prefs["cloudUser"] = json!(self.cloud.user);
-        }
+        cloud::save_prefs(&self.cloud, &mut prefs);
         prefs.to_string()
     }
 
     /// Restore preferences saved by [`Self::prefs_json`]; unknown or malformed values are ignored.
     pub fn load_prefs(&mut self, json: &str) {
         let Ok(v) = serde_json::from_str::<Value>(json) else { return };
-        if let Some(server) = v.get("cloudServer").and_then(Value::as_str) {
-            self.cloud.server = server.to_string();
-        }
-        if let Some(user) = v.get("cloudUser").and_then(Value::as_str) {
-            self.cloud.user = user.to_string();
-        }
+        cloud::load_prefs(&mut self.cloud, &v);
         if let Some(calculator) = v.get("quickcalc") {
             self.quickcalc.load_prefs(calculator);
         }

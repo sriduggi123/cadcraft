@@ -6,8 +6,16 @@ use std::time::{Duration, Instant};
 use cadcraft_engine::Session;
 use serde_json::json;
 
+/// A server without a data folder: its address for `cloud.share`.
 fn start_server() -> String {
-    format!("ws://{}/s/test-plan", start_with(cadcraft_server::Config::default()))
+    format!("http://{}", start_with(cadcraft_server::Config::default()))
+}
+
+/// `s`'s drawing becomes a new cloud file on `server`: the file's WebSocket address.
+fn share(s: &mut Session, server: &str, user: &str) -> String {
+    let r = s.execute("cloud.share", &json!({"server": server, "user": user})).unwrap();
+    assert_eq!(r["joined"], true, "{r}");
+    cadcraft_engine::cmd::collab::parse_link(r["link"].as_str().unwrap()).unwrap().0
 }
 
 /// A server with `config`; its address.
@@ -53,11 +61,10 @@ fn model_len(s: &Session) -> usize {
 
 #[test]
 fn two_sessions_edit_one_drawing_over_the_network() {
-    let url = start_server();
+    let server = start_server();
     let mut a = Session::new();
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
-    let joined = a.execute("collab.join", &json!({"url": url, "name": "Asha", "host": true})).unwrap();
-    assert_eq!(joined["joined"], true, "{joined}");
+    let url = share(&mut a, &server, "Asha");
 
     let mut b = Session::new();
     b.execute("collab.join", &json!({"url": url, "name": "Bo"})).unwrap();
@@ -95,24 +102,25 @@ fn session_names_are_checked() {
 fn a_saved_session_reopens_after_everyone_left_and_after_a_restart() {
     let data = temp_dir("data");
     let config = cadcraft_server::Config { web: None, data: Some(data.clone()) };
-    let url = format!("ws://{}/s/kept", start_with(config.clone()));
     let mut a = Session::new();
-    a.execute("collab.join", &json!({"url": url, "name": "Asha", "host": true})).unwrap();
+    let url = share(&mut a, &format!("http://{}", start_with(config.clone())), "Asha");
+    let id = url.rsplit('/').next().unwrap().to_string();
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
     a.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
     wait(&mut a, "both edits confirmed", |s| s.collab_status().is_some_and(|(_, _, pending)| pending == 0));
     a.execute("collab.leave", &json!({})).unwrap();
-    let file = data.join("kept.cadsession");
+    let file = data.join(format!("{id}.cadsession"));
     let start = Instant::now();
-    while !file.exists() {
+    let saved = |f: &std::path::Path| std::fs::read(f).ok().and_then(|b| cadcraft_collab::snapshot::decode(&b).ok()).map_or(0, |d| d.model.len());
+    while saved(&file) != 2 {
         assert!(start.elapsed() < Duration::from_secs(10), "the session was not saved");
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // A new server over the same folder, as after a restart; the joiner's own drawing is ignored.
-    let url = format!("ws://{}/s/kept", start_with(config));
+    // A new server over the same folder, as after a restart.
+    let url = format!("ws://{}/s/{id}", start_with(config));
     let mut b = Session::new();
-    b.execute("collab.join", &json!({"url": url, "name": "Bo", "host": true})).unwrap();
+    b.execute("collab.join", &json!({"url": url, "name": "Bo"})).unwrap();
     assert_eq!(model_len(&b), 2);
     let _ = std::fs::remove_dir_all(&data);
 }
@@ -123,9 +131,10 @@ fn a_session_downloads_as_dwg_and_dxf() {
     let addr = start_with(cadcraft_server::Config::default());
     let mut a = Session::new();
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
-    a.execute("collab.join", &json!({"url": format!("ws://{addr}/s/out"), "name": "Asha", "host": true})).unwrap();
+    let url = share(&mut a, &format!("http://{addr}"), "Asha");
+    let id = url.rsplit('/').next().unwrap().to_string();
     for ext in ["dwg", "dxf"] {
-        let (status, body) = get(addr, &format!("/s/out.{ext}"));
+        let (status, body) = get(addr, &format!("/s/{id}.{ext}"));
         assert!(status.contains("200"), "{ext}: {status}");
         let d = cadcraft_io::read(&body, format!("out.{ext}")).unwrap();
         assert_eq!(d.model.len(), 1, "{ext}");
@@ -148,41 +157,45 @@ fn a_session_link_serves_the_web_app() {
     let _ = std::fs::remove_dir_all(&web);
 }
 
-/// Cloud files: save a drawing to the cloud, see it in the list with who has it open, open it
-/// from another app, and a second save under the same name is refused.
+/// Cloud files by link: Collaborate makes a file with a long random id and gives its link;
+/// another app opens the link and edits; the status answers only about ids asked for; the
+/// front page lists nothing; a made-up id is refused.
 #[test]
-fn cloud_files_are_saved_listed_and_opened() {
+fn files_are_shared_and_opened_by_link_only() {
     let data = temp_dir("cloud");
     let addr = start_with(cadcraft_server::Config { web: None, data: Some(data.clone()) });
     let server = format!("http://{addr}");
 
     let mut a = Session::new();
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
-    let saved = a.execute("cloud.save", &json!({"name": "plan", "server": server, "user": "Asha"})).unwrap();
-    assert_eq!(saved["joined"], true, "{saved}");
-    assert_eq!(a.state().unwrap().title, "plan");
-
-    let list = a.execute("cloud.list", &json!({"server": server})).unwrap();
-    assert_eq!(list["files"][0]["name"], "plan", "{list}");
-    assert_eq!(list["files"][0]["people"], json!(["Asha"]), "{list}");
+    let shared = a.execute("cloud.share", &json!({"title": "Floor plan", "server": server, "user": "Asha"})).unwrap();
+    let link = shared["link"].as_str().unwrap().to_string();
+    assert!(link.starts_with(&format!("http://{addr}/s/")), "{link}");
+    let id = link.rsplit('/').next().unwrap().to_string();
+    assert_eq!(id.len(), 22, "a 128-bit id");
+    assert_eq!(shared["title"], "Floor plan");
+    assert!(data.join(format!("{id}.cadsession")).exists(), "on disk at once");
 
     let mut b = Session::new();
     let tabs = b.docs.len();
-    b.execute("cloud.open", &json!({"name": "plan", "server": server, "user": "Bo"})).unwrap();
+    b.execute("cloud.open", &json!({"link": link, "user": "Bo"})).unwrap();
     assert_eq!(b.docs.len(), tabs + 1, "opens in a new tab");
-    assert_eq!(b.state().unwrap().title, "plan");
+    assert_eq!(b.state().unwrap().title, "Floor plan");
     assert_eq!(model_len(&b), 1);
     b.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
     wait(&mut a, "Bo's line at Asha", |s| model_len(s) == 2);
 
-    let mut c = Session::new();
-    let err = c.execute("cloud.save", &json!({"name": "plan", "server": server, "user": "Cy"})).unwrap_err();
-    assert!(err.to_string().contains("already exists"), "{err}");
+    let status = a.execute("cloud.status", &json!({"links": [link, format!("{server}/s/made-up-id")]})).unwrap();
+    assert_eq!(status["files"].as_array().map(Vec::len), Some(1), "{status}");
+    assert_eq!(status["files"][0]["title"], "Floor plan");
+    assert_eq!(status["files"][0]["people"], json!(["Asha", "Bo"]));
 
+    let mut c = Session::new();
+    let err = c.execute("cloud.open", &json!({"link": format!("{server}/s/made-up-id")})).unwrap_err();
+    assert!(err.to_string().contains("no file with this link"), "{err}");
     let (status, page) = get(addr, "/");
     assert!(status.contains("200"));
-    let page = String::from_utf8_lossy(&page);
-    assert!(page.contains("plan") && page.contains("2 editing"), "{page}");
+    assert!(!String::from_utf8_lossy(&page).contains(&id), "the front page lists nothing");
     let _ = std::fs::remove_dir_all(&data);
 }
 
@@ -193,6 +206,16 @@ fn cloud_server_addresses_are_normalised() {
     assert_eq!(cloud_server(&json!({"server": "http://10.0.0.2:9010"})), "ws://10.0.0.2:9010");
     assert_eq!(cloud_server(&json!({"server": "cad.example.com:9010"})), "ws://cad.example.com:9010");
     assert_eq!(cloud_server(&json!({"server": "wss://x"})), "wss://x");
+    assert_eq!(cloud_server(&json!({"server": "cad.example.com"})), "wss://cad.example.com");
+    assert_eq!(cloud_server(&json!({"server": "localhost:9010"})), "ws://localhost:9010");
+    use cadcraft_engine::cmd::collab::{parse_link, share_link};
+    let want = ("wss://cad.example.com/s/Ab-9_x".to_string(), "Ab-9_x".to_string());
+    for link in ["https://cad.example.com/s/Ab-9_x", "cad.example.com/s/Ab-9_x/", "wss://cad.example.com/s/Ab-9_x?name=Bo#x"] {
+        assert_eq!(parse_link(link).unwrap(), want, "{link}");
+    }
+    assert!(parse_link("https://cad.example.com/files").is_err());
+    assert!(parse_link("https://cad.example.com/s/../x").is_err());
+    assert_eq!(share_link("wss://cad.example.com/s/Ab"), "https://cad.example.com/s/Ab");
 }
 
 /// Presence: what one person points at, has selected and runs reaches the others; someone who
@@ -200,10 +223,10 @@ fn cloud_server_addresses_are_normalised() {
 /// zooms; an unreachable server fails within the connection timeout.
 #[test]
 fn presence_reaches_the_others_and_follow_copies_the_view() {
-    let url = start_server();
+    let server = start_server();
     let mut a = Session::new();
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
-    a.execute("collab.join", &json!({"url": url, "name": "Asha", "host": true})).unwrap();
+    let url = share(&mut a, &server, "Asha");
     let circle = a.state().unwrap().doc.model.last().map(|e| e.handle).unwrap();
     a.state_mut().unwrap().selection = vec![circle];
     a.collab_presence(Some(cadcraft_engine::geom::Vec2::new(3.0, 4.0)), 1.0);
@@ -284,9 +307,10 @@ fn a_dropped_connection_reconnects_and_catches_up() {
     let server = start_with(cadcraft_server::Config::default());
     let relay = Relay::new(server);
     let mut a = Session::new();
-    a.execute("collab.join", &json!({"url": format!("ws://{}/s/wifi", relay.addr), "name": "Asha", "host": true})).unwrap();
+    let via = share(&mut a, &format!("http://{}", relay.addr), "Asha");
+    let id = via.rsplit('/').next().unwrap().to_string();
     let mut b = Session::new();
-    b.execute("collab.join", &json!({"url": format!("ws://{server}/s/wifi"), "name": "Bo"})).unwrap();
+    b.execute("collab.join", &json!({"url": format!("ws://{server}/s/{id}"), "name": "Bo"})).unwrap();
     let id = a.collab_status().map(|(c, _, _)| c);
     a.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
     wait(&mut b, "Asha's circle", |s| model_len(s) == 1);

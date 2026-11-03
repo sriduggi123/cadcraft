@@ -11,6 +11,8 @@ use crate::{Change, Container, Error, Result, apply, snapshot, space};
 
 /// Most changes in one batch.
 pub const MAX_CHANGES: usize = 200_000;
+/// Longest file title kept.
+pub const MAX_TITLE: usize = 200;
 /// Most blocks locked at once in one session.
 const MAX_LOCKS: usize = 1000;
 
@@ -53,6 +55,9 @@ pub struct Server {
     presence: BTreeMap<u32, Presence>,
     /// Blocks locked for the Block Editor (by name in lower case) and who holds each.
     locks: BTreeMap<String, u32>,
+    /// The cloud file's id and title, told to everyone who joins.
+    file: String,
+    title: String,
 }
 
 impl Server {
@@ -71,6 +76,16 @@ impl Server {
         let used = crate::container::stores(&d).into_iter().flat_map(|(_, s)| s.iter().map(|e| space::space_of(e.handle))).max();
         self.next_client = self.next_client.max(used.unwrap_or(0).saturating_add(1)).max(1);
         self.drawing = Some(d);
+    }
+
+    /// Name the session: the cloud file's id and title.
+    pub fn set_file(&mut self, file: &str, title: &str) {
+        self.file = file.to_string();
+        self.title = title.chars().take(MAX_TITLE).collect();
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     pub fn drawing(&self) -> Option<&Drawing> {
@@ -105,7 +120,8 @@ impl Server {
                 c
             }
         };
-        let welcome = ServerMsg::Welcome { client, seq: self.seq, snapshot: snapshot::encode(d)? };
+        let welcome =
+            ServerMsg::Welcome { client, seq: self.seq, snapshot: snapshot::encode(d)?, file: self.file.clone(), title: self.title.clone() };
         self.clients.insert(client, name.chars().take(64).collect());
         let mut out = vec![Outgoing { to: To::One(client), msg: welcome }, self.peers_msg()];
         out.extend(self.presence.iter().map(|(c, p)| Outgoing { to: To::One(client), msg: ServerMsg::Presence { client: *c, presence: p.clone() } }));
