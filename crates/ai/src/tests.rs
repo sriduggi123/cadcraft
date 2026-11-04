@@ -172,7 +172,145 @@ fn every_tool_definition_names_a_tool_that_runs() {
     let (mut s, _, _) = setup();
     for t in tools::definitions().as_array().unwrap() {
         let name = t["function"]["name"].as_str().unwrap();
+        if tools::USER_TOOLS.contains(&name) {
+            continue;
+        }
         let out = tools::run(&mut s, name, &json!({"query": "line", "text": ""}));
         assert!(!out.result.starts_with("error: there is no tool"), "{name}");
     }
+}
+
+use crate::{Answer, Need, parse_points};
+
+/// The model asks for one call; returns the request id that comes next.
+fn model_calls(a: &mut Assistant, s: &mut Session, wire: &Arc<Mutex<Wire>>, name: &str, args: Value) {
+    let (id, _) = last_request(wire);
+    answer(wire, id, json!({"role": "assistant", "content": "", "tool_calls": [call("t1", name, args)]}));
+    a.tick(s);
+}
+
+/// The last tool result sent to the model.
+fn last_result(wire: &Arc<Mutex<Wire>>) -> String {
+    let (_, req) = last_request(wire);
+    let msgs = req["messages"].as_array().unwrap();
+    let tool = msgs.iter().rev().find(|m| m["role"] == "tool").unwrap();
+    tool["content"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn opening_a_file_waits_for_a_yes_and_a_no_goes_back_to_the_model() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "open my other drawing");
+    model_calls(&mut a, &mut s, &wire, "execute", json!({"command": "open", "params": {"path": "/tmp/x.dxf"}}));
+    assert!(matches!(a.need(), Some(Need::Confirm { lisp: false, .. })), "{:?}", a.need());
+    assert!(wire.lock().unwrap().up.is_empty(), "nothing is sent while the user decides");
+    a.answer(&mut s, Answer::Deny);
+    assert!(a.need().is_none() && a.busy());
+    assert!(last_result(&wire).contains("the user said no"));
+}
+
+#[test]
+fn erasing_many_objects_asks_and_a_few_do_not() {
+    let (mut s, _, _) = setup();
+    let mut handles = Vec::new();
+    for i in 0..25 {
+        let r = s.execute("circle", &json!({"center": [i * 10, 0], "radius": 1})).unwrap();
+        handles.push(r["handle"].clone());
+    }
+    let few = json!({"command": "erase", "params": {"handles": handles[..3]}});
+    let many = json!({"command": "erase", "params": {"handles": handles}});
+    assert!(tools::permission(&s, "execute", &few, false).is_none());
+    assert_eq!(tools::permission(&s, "execute", &many, false).as_deref(), Some("erase 25 objects"));
+    assert!(tools::permission(&s, "command_line", &json!({"text": "_.erase all"}), false).is_some());
+    assert!(tools::permission(&s, "command_line", &json!({"text": "c 0,0 5"}), false).is_none());
+    assert!(tools::permission(&s, "execute", &json!({"command": "lisp", "params": {"code": "(command \"erase\")"}}), true).is_some());
+    assert!(tools::permission(&s, "run_lisp", &json!({"code": "(+ 1 2)"}), false).is_some());
+    assert!(tools::permission(&s, "run_lisp", &json!({"code": "(+ 1 2)"}), true).is_none());
+}
+
+#[test]
+fn lisp_allowed_for_the_chat_runs_without_asking_again() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "add up");
+    model_calls(&mut a, &mut s, &wire, "run_lisp", json!({"code": "(+ 1 2)"}));
+    assert!(matches!(a.need(), Some(Need::Confirm { lisp: true, .. })));
+    a.answer(&mut s, Answer::AllowLisp);
+    assert!(last_result(&wire).contains("\"value\":\"3\""), "{}", last_result(&wire));
+    // The next routine in the same chat runs at once.
+    wire.lock().unwrap().up.push_back(ClientMsg::Ai { id: a.next_id - 1, conversation: String::new(), request: Json(json!({})) });
+    model_calls(&mut a, &mut s, &wire, "run_lisp", json!({"code": "(* 2 5)"}));
+    assert!(a.need().is_none());
+    assert!(last_result(&wire).contains("\"value\":\"10\""), "{}", last_result(&wire));
+}
+
+#[test]
+fn a_question_waits_for_the_users_answer() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "draw a hole");
+    model_calls(&mut a, &mut s, &wire, "ask_user", json!({"question": "What diameter?", "options": ["5", "8"]}));
+    assert_eq!(a.need(), Some(&Need::Ask { question: "What diameter?".into(), options: vec!["5".into(), "8".into()] }));
+    a.answer(&mut s, Answer::Text("8".into()));
+    assert!(last_result(&wire).contains("\"answer\":\"8\""));
+}
+
+#[test]
+fn picked_points_come_from_the_point_prompt() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "put a circle where I click");
+    model_calls(&mut a, &mut s, &wire, "pick_points", json!({"prompt": "Pick \"the\" centre", "count": 2}));
+    assert!(matches!(a.need(), Some(Need::Points { count: 2, .. })));
+    assert!(s.prompt_text().contains("Pick \"the\" centre (1 of 2)"), "{}", s.prompt_text());
+    s.input(cadcraft_engine::Input::Point(cadcraft_engine::geom::Vec2::new(4.0, 5.0))).unwrap();
+    assert!(!a.tick(&mut s), "still waiting for the second point");
+    s.input(cadcraft_engine::Input::Point(cadcraft_engine::geom::Vec2::new(-1.5, 2.0))).unwrap();
+    assert!(a.tick(&mut s));
+    assert!(last_result(&wire).contains("[[4.0,5.0,0.0],[-1.5,2.0,0.0]]"), "{}", last_result(&wire));
+}
+
+#[test]
+fn cancelling_a_point_pick_tells_the_model() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "click somewhere");
+    model_calls(&mut a, &mut s, &wire, "pick_points", json!({"prompt": "Pick"}));
+    a.answer(&mut s, Answer::Cancel);
+    a.tick(&mut s);
+    assert!(last_result(&wire).contains("did not pick"), "{}", last_result(&wire));
+    assert!(!s.lisp_running());
+}
+
+#[test]
+fn picked_objects_are_the_selection() {
+    let (mut s, mut a, wire) = setup();
+    let h = s.execute("circle", &json!({"center": [0, 0], "radius": 1})).unwrap()["handle"].as_str().unwrap().to_string();
+    a.ask(&mut s, "make this red");
+    model_calls(&mut a, &mut s, &wire, "pick_objects", json!({"prompt": "Select the objects to colour"}));
+    s.set_selection(vec![cadcraft_engine::doc::Handle(u64::from_str_radix(&h, 16).unwrap())]);
+    a.answer(&mut s, Answer::Done);
+    assert!(last_result(&wire).contains(&h), "{}", last_result(&wire));
+}
+
+#[test]
+fn a_picture_goes_to_the_model_and_only_the_latest_is_kept() {
+    let (mut s, mut a, wire) = setup();
+    s.execute("circle", &json!({"center": [0, 0], "radius": 5})).unwrap();
+    a.ask(&mut s, "look");
+    model_calls(&mut a, &mut s, &wire, "render", json!({}));
+    let (id, req) = last_request(&wire);
+    let last = req["messages"].as_array().unwrap().last().unwrap().clone();
+    assert!(last["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    // A second picture replaces the first in what is sent.
+    answer(&wire, id, json!({"role": "assistant", "content": "", "tool_calls": [call("t2", "render", json!({"window": [[-1, -1], [1, 1]]}))]}));
+    a.tick(&mut s);
+    let (_, req) = last_request(&wire);
+    let pictures = req["messages"].as_array().unwrap().iter().filter(|m| m["content"].is_array()).count();
+    assert_eq!(pictures, 1);
+    assert!(req.to_string().contains("no longer shown"));
+}
+
+#[test]
+fn printed_point_lists_are_read() {
+    assert_eq!(parse_points("((1.0 2.0 0.0) (3.5 -4.0 1.0))"), vec![[1.0, 2.0, 0.0], [3.5, -4.0, 1.0]]);
+    assert_eq!(parse_points("((1.0 2.0 0.0) nil)"), vec![[1.0, 2.0, 0.0]]);
+    assert!(parse_points("nil").is_empty());
+    assert!(parse_points("((nan 1.0))").is_empty());
 }

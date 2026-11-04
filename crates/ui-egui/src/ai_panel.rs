@@ -1,7 +1,7 @@
 //! Tools ▸ AI Assistant…: a chat window. What the user types goes to [`cadcraft_ai::Assistant`],
 //! which reads and changes the open drawing through tools; this panel only shows the chat.
 
-use cadcraft_ai::{Assistant, Entry};
+use cadcraft_ai::{Answer, Assistant, Entry, Need};
 use serde_json::{Value, json};
 
 use crate::CadApp;
@@ -43,11 +43,16 @@ pub fn tick(app: &mut CadApp, ctx: &egui::Context) {
     if a.tick(&mut app.session) {
         ctx.request_repaint();
     }
+    // A question or a pick needs the window, even if it was closed meanwhile.
+    if a.need().is_some() {
+        app.ai.open = true;
+    }
     ctx.request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 enum Do {
     Send(String),
+    Answer(Answer),
     Stop,
     Clear,
 }
@@ -61,6 +66,7 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     let assistant = st.assistant.get_or_insert_with(|| Assistant::new(&server));
     assistant.set_server(&server);
     let busy = assistant.busy();
+    let need = assistant.need().cloned();
     let t = Tokens::get();
     let mut open = true;
     let mut action = None;
@@ -95,7 +101,7 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
                         }
                     }
                 }
-                if busy {
+                if busy && need.is_none() {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(crate::tl!("Thinking…"));
@@ -103,6 +109,9 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
                 }
             });
             ui.separator();
+            if let Some(need) = &need {
+                show_need(ui, need, &t, &mut action);
+            }
             let r = ui.add(
                 egui::TextEdit::multiline(&mut st.input)
                     .hint_text(crate::tl!("Message the assistant (Enter sends, Shift+Enter for a new line)"))
@@ -119,9 +128,12 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
                 st.input = text;
             }
             ui.horizontal(|ui| {
-                let can = !busy && !st.input.trim().is_empty();
+                // While the assistant asks a question, what is typed is the answer.
+                let asked = matches!(need, Some(Need::Ask { .. }));
+                let can = (!busy || asked) && !st.input.trim().is_empty();
                 if ui.add_enabled(can, egui::Button::new(crate::tl!("Send"))).clicked() || (enter && can) {
-                    action = Some(Do::Send(std::mem::take(&mut st.input)));
+                    let text = std::mem::take(&mut st.input);
+                    action = Some(if asked { Do::Answer(Answer::Text(text)) } else { Do::Send(text) });
                     st.focus = true;
                 }
                 if busy && ui.button(crate::tl!("Stop")).clicked() {
@@ -142,8 +154,74 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     let Some(a) = app.ai.assistant.as_mut() else { return };
     match action {
         Do::Send(text) => a.ask(&mut app.session, &text),
+        Do::Answer(answer) => a.answer(&mut app.session, answer),
         Do::Stop => a.stop(&mut app.session),
         Do::Clear => a.clear(&mut app.session),
     }
     ctx.request_repaint();
+}
+
+/// What the assistant waits for, with the buttons that answer it.
+fn show_need(ui: &mut egui::Ui, need: &Need, t: &Tokens, action: &mut Option<Do>) {
+    egui::Frame::new().fill(t.field).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        match need {
+            Need::Confirm { what, lisp } => {
+                ui.label(egui::RichText::new(crate::tl!("The assistant wants to:")).strong());
+                egui::ScrollArea::vertical().id_salt("ai_confirm").max_height(140.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new(what).monospace());
+                });
+                ui.horizontal(|ui| {
+                    if ui.button(crate::tl!("Allow")).clicked() {
+                        *action = Some(Do::Answer(Answer::Allow));
+                    }
+                    if *lisp && ui.button(crate::tl!("Allow LISP in This Chat")).clicked() {
+                        *action = Some(Do::Answer(Answer::AllowLisp));
+                    }
+                    if ui.button(crate::tl!("Don't Allow")).clicked() {
+                        *action = Some(Do::Answer(Answer::Deny));
+                    }
+                });
+            }
+            Need::Ask { question, options } => {
+                ui.label(egui::RichText::new(question).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for o in options {
+                        if ui.button(o).clicked() {
+                            *action = Some(Do::Answer(Answer::Text(o.clone())));
+                        }
+                    }
+                    if ui.small_button(crate::tl!("Skip")).clicked() {
+                        *action = Some(Do::Answer(Answer::Cancel));
+                    }
+                });
+                ui.label(egui::RichText::new(crate::tl!("Or type an answer below.")).small().color(t.text_dim));
+            }
+            Need::Points { prompt, count } => {
+                let what = if *count == 1 {
+                    crate::tl!("Click a point in the drawing.").to_string()
+                } else {
+                    format!("{} {count}", crate::tl!("Points to click in the drawing:"))
+                };
+                ui.label(egui::RichText::new(prompt).strong());
+                ui.label(what);
+                if ui.button(crate::tl!("Cancel")).clicked() {
+                    *action = Some(Do::Answer(Answer::Cancel));
+                }
+            }
+            Need::Objects { prompt } => {
+                ui.label(egui::RichText::new(prompt).strong());
+                ui.label(crate::tl!("Select the objects in the drawing, then press Done."));
+                ui.horizontal(|ui| {
+                    if ui.button(crate::tl!("Done")).clicked() {
+                        *action = Some(Do::Answer(Answer::Done));
+                    }
+                    if ui.button(crate::tl!("Cancel")).clicked() {
+                        *action = Some(Do::Answer(Answer::Cancel));
+                    }
+                });
+            }
+        }
+    });
+    ui.add_space(4.0);
 }

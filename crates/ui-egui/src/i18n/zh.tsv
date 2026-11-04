@@ -1494,3 +1494,13 @@ menu	View	视图
 	Start over; the drawing keeps its changes	重新开始；图形保留已做的更改
 	Message the assistant (Enter sends, Shift+Enter for a new line)	给助手发消息（按 Enter 发送，Shift+Enter 换行）
 	Ask about the drawing, or ask for a change: “dimension the plate”, “move the text on layer Notes to Annotation”.	询问有关图形的问题，或要求修改：“为板件标注尺寸”、“把 Notes 图层上的文字移到 Annotation 图层”。
+	The assistant wants to:	助手想要：
+	Allow	允许
+	Allow LISP in This Chat	在此对话中允许 LISP
+	Don't Allow	不允许
+	Skip	跳过
+	Or type an answer below.	或在下方输入答案。
+	Click a point in the drawing.	在图形中单击一个点。
+	Points to click in the drawing:	要在图形中单击的点数：
+	Select the objects in the drawing, then press Done.	在图形中选择对象，然后按“完成”。
+	Done	完成

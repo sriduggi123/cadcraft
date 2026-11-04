@@ -659,6 +659,7 @@ dependencies = [
  "cadcraft-collab-net",
  "cadcraft-engine",
  "cadcraft-io",
+ "cadcraft-render",
  "serde_json",
  "web-time",
 ]

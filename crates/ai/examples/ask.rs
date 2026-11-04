@@ -1,8 +1,9 @@
 //! Ask the assistant from a terminal, against a drawing in memory:
-//! `cargo run -p cadcraft-ai --example ask -- [--server wss://host] [--open file.dxf] "request"`.
-//! Prints the chat as it goes and the entity counts at the end.
+//! `cargo run -p cadcraft-ai --example ask -- [--server wss://host] [--open file.dxf] [--yes] "request"`.
+//! Prints the chat as it goes and the entity counts at the end. `--yes` allows what the assistant
+//! asks to do; its questions are answered from the keyboard; picks in the drawing are cancelled.
 
-use cadcraft_ai::{Assistant, Entry};
+use cadcraft_ai::{Answer, Assistant, Entry, Need};
 use cadcraft_engine::Session;
 use serde_json::json;
 
@@ -16,6 +17,7 @@ fn main() {
     };
     let server = take("--server").unwrap_or_else(|| cadcraft_engine::cmd::collab::DEFAULT_SERVER.to_string());
     let open = take("--open");
+    let yes = args.iter().position(|a| a == "--yes").map(|i| args.remove(i)).is_some();
     let prompt = args.join(" ");
     if prompt.trim().is_empty() {
         eprintln!("usage: ask [--server wss://host] [--open file.dxf] \"request\"");
@@ -49,6 +51,23 @@ fn main() {
             }
         }
         shown = a.log.len();
+        match a.need().cloned() {
+            Some(Need::Confirm { what, .. }) => {
+                println!("? allow: {what} -> {}", if yes { "yes" } else { "no" });
+                a.answer(&mut s, if yes { Answer::Allow } else { Answer::Deny });
+            }
+            Some(Need::Ask { question, options }) => {
+                println!("? {question} {options:?}");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                a.answer(&mut s, Answer::Text(line.trim().to_string()));
+            }
+            Some(Need::Points { .. } | Need::Objects { .. }) => {
+                println!("? (a pick in the drawing; cancelled here)");
+                a.answer(&mut s, Answer::Cancel);
+            }
+            None => {}
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     for e in a.log.iter().skip(shown) {

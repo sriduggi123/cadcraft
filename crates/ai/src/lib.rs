@@ -3,6 +3,10 @@
 //! the open drawing ([`tools`]), sends their results back, and repeats until the model answers.
 //! Everything one request changes is one undo step ("AI: …").
 //!
+//! Some calls need the user: a question ([`Need::Ask`]), points or objects picked in the drawing
+//! ([`Need::Points`], [`Need::Objects`]), or a yes before something hard to take back
+//! ([`Need::Confirm`]). The request waits for [`Assistant::answer`] and then goes on.
+//!
 //! It never blocks: the answer arrives on the WebSocket link and [`Assistant::tick`], called
 //! every frame, picks it up.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -11,6 +15,7 @@
 pub mod prompt;
 pub mod tools;
 
+use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
 
 use cadcraft_collab::message::{ClientMsg, ServerMsg};
@@ -27,6 +32,8 @@ pub const WAIT: Duration = Duration::from_secs(200);
 pub const MAX_PROMPT: usize = 8000;
 /// Most messages kept in the chat sent to the model (older ones are dropped, oldest first).
 const MAX_MESSAGES: usize = 200;
+/// The LISP variable the picked points are left in.
+const PICKS: &str = "*cadcraft-ai-picks*";
 
 /// One line of the chat panel.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,10 +48,52 @@ pub enum Entry {
     Error(String),
 }
 
+/// What the request waits for from the user.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Need {
+    /// A yes or no before a call that is hard to take back. `lisp`: the call runs a LISP routine,
+    /// which may also be allowed for the rest of the chat.
+    Confirm { what: String, lisp: bool },
+    /// A question, with suggested answers (the user may also type one).
+    Ask { question: String, options: Vec<String> },
+    /// Points clicked in the drawing (the command line's point prompt, with object snaps).
+    Points { prompt: String, count: usize },
+    /// Objects selected in the drawing, then Done.
+    Objects { prompt: String },
+}
+
+/// The user's reply to a [`Need`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Answer {
+    Allow,
+    /// Allow this and every later LISP routine in this chat.
+    AllowLisp,
+    Deny,
+    Text(String),
+    /// The objects are selected.
+    Done,
+    Cancel,
+}
+
+/// What to do with one tool call.
+enum Next {
+    Run,
+    Wait(Need),
+    /// Already answered (e.g. a pick that could not start).
+    Done(tools::Outcome),
+}
+
+struct Call {
+    id: String,
+    name: String,
+    args: Value,
+}
+
 enum State {
     Idle,
     Connecting { rx: Receiver<Result<Box<dyn Link>, String>> },
     Waiting { id: u64, since: Instant },
+    User { call: Call, need: Need },
 }
 
 /// The chat with the model and its connection.
@@ -63,6 +112,12 @@ pub struct Assistant {
     undo: Option<(usize, String)>,
     /// The request being connected for, sent once the link is up.
     queued: bool,
+    /// The model's tool calls not run yet, in order.
+    calls: VecDeque<Call>,
+    /// Pictures from `render` this round, sent after the tool results.
+    pictures: Vec<String>,
+    /// The user allowed LISP routines for this chat.
+    lisp_ok: bool,
 }
 
 /// An id for one chat, for the provider's session header: the time and a counter (not secret).
@@ -89,6 +144,29 @@ fn connect_later(url: &str) -> Receiver<Result<Box<dyn Link>, String>> {
     rx
 }
 
+/// Text for a LISP string literal.
+fn lisp_string(s: &str) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).take(200).collect();
+    format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The points in a printed LISP list of points, e.g. `((1.0 2.0 0.0) (3.5 4.0 0.0))`; `nil`
+/// entries (a pick the user skipped) are left out.
+pub fn parse_points(printed: &str) -> Vec<[f64; 3]> {
+    let mut out = Vec::new();
+    let inner = printed.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or("");
+    let mut rest = inner;
+    while let Some(open) = rest.find('(') {
+        let Some(close) = rest[open..].find(')') else { break };
+        let nums: Vec<f64> = rest[open + 1..open + close].split_whitespace().filter_map(|n| n.parse().ok()).filter(|n: &f64| n.is_finite()).collect();
+        if nums.len() >= 2 {
+            out.push([nums[0], nums[1], nums.get(2).copied().unwrap_or(0.0)]);
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out
+}
+
 impl Assistant {
     /// An assistant using the cloud server at `server` (`wss://host` or `ws://host:port`).
     pub fn new(server: &str) -> Assistant {
@@ -103,6 +181,9 @@ impl Assistant {
             rounds: 0,
             undo: None,
             queued: false,
+            calls: VecDeque::new(),
+            pictures: Vec::new(),
+            lisp_ok: false,
         }
     }
 
@@ -120,9 +201,17 @@ impl Assistant {
         }
     }
 
-    /// Whether a request is in progress.
+    /// Whether a request is in progress (also while it waits for the user).
     pub fn busy(&self) -> bool {
         !matches!(self.state, State::Idle)
+    }
+
+    /// What the request waits for from the user, if anything.
+    pub fn need(&self) -> Option<&Need> {
+        match &self.state {
+            State::User { need, .. } => Some(need),
+            _ => None,
+        }
     }
 
     /// Start over: a new chat (the drawing keeps its changes).
@@ -130,6 +219,7 @@ impl Assistant {
         self.stop(s);
         self.messages.clear();
         self.log.clear();
+        self.lisp_ok = false;
         self.conversation = conversation_id();
     }
 
@@ -159,7 +249,7 @@ impl Assistant {
     /// still starts with what the user asked (never with a tool result).
     fn trim(&mut self) {
         let over = self.messages.len().saturating_sub(MAX_MESSAGES);
-        let from = self.messages.iter().enumerate().skip(over.max(1)).find(|(_, m)| m["role"] == "user").map(|(i, _)| i);
+        let from = self.messages.iter().enumerate().skip(over.max(1)).find(|(_, m)| m["role"] == "user" && m["content"].is_string()).map(|(i, _)| i);
         if let Some(i) = from {
             self.messages.drain(..i);
         }
@@ -172,8 +262,13 @@ impl Assistant {
             // A reply to an abandoned request must not be taken for the next one's.
             self.link = None;
         }
+        if matches!(self.state, State::User { need: Need::Points { .. }, .. }) && s.lisp_running() {
+            s.lisp_abort("Function cancelled");
+        }
         self.state = State::Idle;
         self.queued = false;
+        self.calls.clear();
+        self.pictures.clear();
         self.finish(s);
     }
 
@@ -192,11 +287,29 @@ impl Assistant {
         self.log.push(Entry::Error(why));
         self.state = State::Idle;
         self.queued = false;
+        self.calls.clear();
+        self.pictures.clear();
         self.finish(s);
+    }
+
+    /// The chat as sent: only the latest picture is kept, older ones become a note (each costs
+    /// thousands of tokens on every request).
+    fn outgoing(&self) -> Vec<Value> {
+        let last_picture = self.messages.iter().rposition(|m| m["content"].is_array());
+        let mut out = vec![json!({"role": "system", "content": prompt::SYSTEM})];
+        for (i, m) in self.messages.iter().enumerate() {
+            if m["content"].is_array() && Some(i) != last_picture {
+                out.push(json!({"role": "user", "content": "[an earlier picture of the drawing, no longer shown]"}));
+            } else {
+                out.push(m.clone());
+            }
+        }
+        out
     }
 
     /// Send the chat as it is now.
     fn send(&mut self, s: &mut Session) {
+        let messages = self.outgoing();
         let Some(link) = self.link.as_mut().filter(|l| l.is_open()) else {
             self.link = None;
             self.queued = true;
@@ -205,8 +318,6 @@ impl Assistant {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let mut messages = vec![json!({"role": "system", "content": prompt::SYSTEM})];
-        messages.extend(self.messages.iter().cloned());
         let request = Json(json!({"messages": messages, "tools": tools::definitions()}));
         match link.send(&ClientMsg::Ai { id, conversation: self.conversation.clone(), request }) {
             Ok(()) => self.state = State::Waiting { id, since: Instant::now() },
@@ -219,6 +330,27 @@ impl Assistant {
     pub fn tick(&mut self, s: &mut Session) -> bool {
         match &self.state {
             State::Idle => false,
+            State::User { need: Need::Points { .. }, .. } => {
+                if s.lisp_running() {
+                    return false;
+                }
+                let State::User { call, .. } = std::mem::replace(&mut self.state, State::Idle) else { return false };
+                let printed =
+                    s.execute("lisp", &json!({"code": PICKS})).ok().and_then(|v| v.get("value").and_then(Value::as_str).map(str::to_string));
+                let points = printed.as_deref().map(parse_points).unwrap_or_default();
+                let out = if points.is_empty() {
+                    tools::Outcome::err("the user did not pick a point".into(), "No points picked".into())
+                } else {
+                    tools::Outcome::ok(
+                        json!({ "points": points }),
+                        format!("You picked {} point{}", points.len(), if points.len() == 1 { "" } else { "s" }),
+                    )
+                };
+                self.result(&call, out);
+                self.work(s);
+                true
+            }
+            State::User { .. } => false,
             State::Connecting { rx } => match rx.try_recv() {
                 Ok(Ok(link)) => {
                     self.link = Some(link);
@@ -299,26 +431,141 @@ impl Assistant {
             self.finish(s);
             return;
         }
-        for call in &calls {
-            let id = call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            let raw = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
-            let out = match serde_json::from_str::<Value>(if raw.trim().is_empty() { "{}" } else { raw }) {
-                Ok(args) => tools::run(s, name, &args),
-                Err(e) => tools::Outcome {
-                    result: format!("error: the arguments are not JSON: {e}"),
-                    ok: false,
-                    line: format!("Could not read the call to {name}"),
+        self.state = State::Idle;
+        self.calls = calls
+            .iter()
+            .map(|c| Call {
+                id: c.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                name: c.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string(),
+                args: {
+                    let raw = c.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}");
+                    serde_json::from_str(if raw.trim().is_empty() { "{}" } else { raw }).unwrap_or(Value::Null)
                 },
-            };
-            self.log.push(Entry::Tool { line: out.line, ok: out.ok });
-            self.messages.push(json!({"role": "tool", "tool_call_id": id, "content": out.result}));
+            })
+            .collect();
+        self.work(s);
+    }
+
+    /// Record a call's result for the model and the panel.
+    fn result(&mut self, call: &Call, out: tools::Outcome) {
+        self.log.push(Entry::Tool { line: out.line, ok: out.ok });
+        self.messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": out.result}));
+        if let Some(p) = out.picture {
+            self.pictures.push(p);
+        }
+    }
+
+    /// Run the waiting calls in order until one needs the user; when all are done, send.
+    fn work(&mut self, s: &mut Session) {
+        while let Some(call) = self.calls.pop_front() {
+            if !call.args.is_object() {
+                let line = format!("Could not read the call to {}", call.name);
+                self.result(&call, tools::Outcome::err("the arguments are not a JSON object".into(), line));
+                continue;
+            }
+            match self.need_for(s, &call) {
+                Next::Wait(need) => {
+                    self.state = State::User { call, need };
+                    return;
+                }
+                Next::Done(out) => self.result(&call, out),
+                Next::Run => {
+                    let out = tools::run(s, &call.name, &call.args);
+                    self.result(&call, out);
+                }
+            }
+        }
+        if !self.pictures.is_empty() {
+            let mut content = vec![json!({"type": "text", "text": "The picture render made:"})];
+            content.extend(self.pictures.drain(..).map(|url| json!({"type": "image_url", "image_url": {"url": url}})));
+            self.messages.push(json!({"role": "user", "content": content}));
         }
         self.rounds += 1;
         if self.rounds >= MAX_ROUNDS {
             return self.fail(s, format!("Stopped after {MAX_ROUNDS} steps; ask again to go on."));
         }
         self.send(s);
+    }
+
+    /// What to do with `call`: run it, or wait for the user. Starting a point pick happens here:
+    /// the command line asks for the points.
+    fn need_for(&mut self, s: &mut Session, call: &Call) -> Next {
+        let text = |k: &str| call.args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+        match call.name.as_str() {
+            "ask_user" => {
+                let options = call
+                    .args
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|o| o.iter().filter_map(Value::as_str).take(8).map(str::to_string).collect())
+                    .unwrap_or_default();
+                Next::Wait(Need::Ask { question: text("question"), options })
+            }
+            "pick_objects" => Next::Wait(Need::Objects { prompt: text("prompt") }),
+            "pick_points" => {
+                let count = call.args.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 20) as usize;
+                let prompt = if text("prompt").is_empty() { "Pick a point".to_string() } else { text("prompt") };
+                let picks: Vec<String> = (1..=count)
+                    .map(|i| {
+                        format!(
+                            "(getpoint {})",
+                            lisp_string(&if count == 1 { format!("{prompt}: ") } else { format!("{prompt} ({i} of {count}): ") })
+                        )
+                    })
+                    .collect();
+                let code = format!("(setq {PICKS} nil) (setq {PICKS} (list {}))", picks.join(" "));
+                match s.lisp_eval(&code, false, false, Vec::new()) {
+                    Ok(_) if s.lisp_running() => Next::Wait(Need::Points { prompt, count }),
+                    Ok(_) => Next::Done(tools::Outcome::err("no point prompt could be shown".into(), "Could not ask for points".into())),
+                    Err(e) => Next::Done(tools::Outcome::err(e.to_string(), "Could not ask for points".into())),
+                }
+            }
+            _ => match tools::permission(s, &call.name, &call.args, self.lisp_ok) {
+                Some(what) => Next::Wait(Need::Confirm { lisp: call.name == "run_lisp", what }),
+                None => Next::Run,
+            },
+        }
+    }
+
+    /// The user's reply to what the request waits for ([`Assistant::need`]).
+    pub fn answer(&mut self, s: &mut Session, answer: Answer) {
+        let State::User { need, .. } = &self.state else { return };
+        // A point pick ends when its LISP routine does; cancelling it cancels the routine.
+        if matches!(need, Need::Points { .. }) {
+            if answer == Answer::Cancel && s.lisp_running() {
+                s.lisp_abort("Function cancelled");
+            }
+            return;
+        }
+        let State::User { call, need } = std::mem::replace(&mut self.state, State::Idle) else { return };
+        let out = match (need, answer) {
+            (Need::Confirm { .. }, Answer::Allow) => tools::run(s, &call.name, &call.args),
+            (Need::Confirm { .. }, Answer::AllowLisp) => {
+                self.lisp_ok = true;
+                tools::run(s, &call.name, &call.args)
+            }
+            (Need::Confirm { what, .. }, _) => {
+                tools::Outcome::err("the user said no; don't do it another way".into(), format!("You declined: {what}"))
+            }
+            (Need::Ask { .. }, Answer::Text(t)) if !t.trim().is_empty() => {
+                let t: String = t.trim().chars().take(MAX_PROMPT).collect();
+                tools::Outcome::ok(json!({ "answer": t }), format!("You answered: {t}"))
+            }
+            (Need::Ask { .. }, _) => tools::Outcome::err("the user did not answer".into(), "No answer".into()),
+            (Need::Objects { .. }, Answer::Done) => {
+                let handles: Vec<String> = s.selection().iter().take(5000).map(|h| h.hex()).collect();
+                let line = format!("You selected {} object{}", handles.len(), if handles.len() == 1 { "" } else { "s" });
+                if handles.is_empty() {
+                    tools::Outcome::err("the user selected nothing".into(), line)
+                } else {
+                    tools::Outcome::ok(json!({ "handles": handles }), line)
+                }
+            }
+            (Need::Objects { .. }, _) => tools::Outcome::err("the user did not select objects".into(), "No objects selected".into()),
+            (Need::Points { .. }, _) => return,
+        };
+        self.result(&call, out);
+        self.work(s);
     }
 }
 
