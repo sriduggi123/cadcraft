@@ -314,3 +314,37 @@ fn printed_point_lists_are_read() {
     assert!(parse_points("nil").is_empty());
     assert!(parse_points("((nan 1.0))").is_empty());
 }
+
+#[test]
+fn every_skill_file_reads_and_is_in_the_prompt() {
+    let all = crate::skills::all();
+    assert_eq!(all.len(), 8, "a skill file has a bad header: {:?}", all.iter().map(|s| &s.name).collect::<Vec<_>>());
+    let system = crate::prompt::system();
+    for s in &all {
+        assert!(system.contains(&format!("- {}: ", s.name)), "{}", s.name);
+        assert!(s.body.starts_with("# "), "{}: {:?}", s.name, s.body.chars().take(20).collect::<String>());
+    }
+    assert!(crate::skills::parse("no header").is_none());
+    assert!(crate::skills::parse("---\nname: x\n---\nbody").is_none(), "needs when:");
+}
+
+#[test]
+fn load_skill_returns_the_body_or_the_names() {
+    let (mut s, _, _) = setup();
+    let out = tools::run(&mut s, "load_skill", &json!({"name": "Layer-Cleanup"}));
+    assert!(out.ok && out.result.contains("laymrg"), "{}", out.result);
+    let out = tools::run(&mut s, "load_skill", &json!({"name": "juggling"}));
+    assert!(!out.ok && out.result.contains("dimension-a-part"));
+}
+
+#[test]
+fn a_line_the_model_repeats_is_shown_once() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "look twice");
+    for i in 0..2 {
+        let (id, _) = last_request(&wire);
+        answer(&wire, id, json!({"role": "assistant", "content": "Checking.", "tool_calls": [call(&format!("c{i}"), "drawing_summary", json!({}))]}));
+        a.tick(&mut s);
+    }
+    assert_eq!(a.log.iter().filter(|e| **e == Entry::Assistant("Checking.".into())).count(), 1);
+}

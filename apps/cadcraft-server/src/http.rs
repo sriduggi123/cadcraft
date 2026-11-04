@@ -57,6 +57,9 @@ pub enum Route {
 }
 
 /// Route a request path (query string removed).
+/// Where the web app opens without a cloud file.
+pub const APP: &str = "/app";
+
 pub fn route(path: &str) -> Route {
     let path = path.split('?').next().unwrap_or_default();
     if let Some((stem, ext)) = path.rsplit_once('.')
@@ -67,6 +70,10 @@ pub fn route(path: &str) -> Route {
     }
     if path == "/" {
         return Route::List;
+    }
+    // The web app on its own, with no cloud file joined (its files are next to it, at `/`).
+    if path == APP {
+        return Route::App;
     }
     if session_name(path.trim_end_matches('/')).is_some() {
         return Route::App;
@@ -137,7 +144,8 @@ pub(crate) fn respond(stream: &mut TcpStream, head: &[u8], rooms: &Rooms) -> std
 fn home_page() -> String {
     "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>CADCraft Cloud</title>\n\
 <style>:root{color-scheme:light dark}body{font:15px system-ui,sans-serif;margin:24px 16px;max-width:720px}</style>\n\
-<h1>CADCraft Cloud</h1>\n<p>Open a shared drawing with its link. To share one, open it in CADCraft and choose File ▸ Collaborate….</p>\n"
+<h1>CADCraft Cloud</h1>\n<p><a href=\"/app\">Open CADCraft in your browser</a> · <a href=\"/app?sample\">with a sample drawing</a></p>\n\
+<p>Open a shared drawing with its link. To share one, open it in CADCraft and choose File ▸ Collaborate….</p>\n"
         .to_string()
 }
 
@@ -160,6 +168,8 @@ mod tests {
     #[test]
     fn requests_are_routed() {
         assert_eq!(route("/"), Route::List);
+        assert_eq!(route("/app"), Route::App);
+        assert_eq!(route("/app?x=1"), Route::App);
         assert_eq!(route("/s/plan"), Route::App);
         assert_eq!(route("/s/plan/?name=Bo"), Route::App);
         assert_eq!(route("/s/plan.dwg"), Route::Export { name: "plan".into(), dxf: false });

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod prompt;
+pub mod skills;
 pub mod tools;
 
 use std::collections::VecDeque;
@@ -296,7 +297,7 @@ impl Assistant {
     /// thousands of tokens on every request).
     fn outgoing(&self) -> Vec<Value> {
         let last_picture = self.messages.iter().rposition(|m| m["content"].is_array());
-        let mut out = vec![json!({"role": "system", "content": prompt::SYSTEM})];
+        let mut out = vec![json!({"role": "system", "content": prompt::system()})];
         for (i, m) in self.messages.iter().enumerate() {
             if m["content"].is_array() && Some(i) != last_picture {
                 out.push(json!({"role": "user", "content": "[an earlier picture of the drawing, no longer shown]"}));
@@ -423,7 +424,9 @@ impl Assistant {
             kept["tool_calls"] = json!(calls);
         }
         self.messages.push(kept);
-        if !text.is_empty() {
+        // Models often repeat the same line before each step; the panel shows it once.
+        let repeated = self.log.iter().rev().take_while(|e| !matches!(e, Entry::User(_))).any(|e| *e == Entry::Assistant(text.clone()));
+        if !text.is_empty() && !repeated {
             self.log.push(Entry::Assistant(text));
         }
         if calls.is_empty() {

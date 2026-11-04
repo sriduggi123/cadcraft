@@ -68,6 +68,12 @@ pub fn definitions() -> Value {
             &[]
         ),
         tool(
+            "load_skill",
+            "Read a skill (a playbook for a kind of request, listed in the instructions) before doing the work.",
+            json!({"name": {"type": "string"}}),
+            &["name"]
+        ),
+        tool(
             "render",
             "A picture of the drawing (model space or the current layout) to look at: the whole drawing, or a window [[x0,y0],[x1,y1]] in drawing units to see part of it closer. Use it to understand a layout, or to check what you drew looks right.",
             json!({"window": window()}),
@@ -291,6 +297,16 @@ pub fn run(s: &mut Session, name: &str, args: &Value) -> Outcome {
         "find_text" => done(ex(s, "texts", &paged(args)), "Read the texts".into()),
         "find_commands" => done(Ok(find_commands(s, str_arg(args, "query"))), format!("Looked up \"{}\"", str_arg(args, "query"))),
         "app_state" => done(Ok(app_state(s)), "Checked what you're doing".into()),
+        "load_skill" => {
+            let name = str_arg(args, "name");
+            match crate::skills::find(name) {
+                Some(skill) => Outcome { result: skill.body, ok: true, line: format!("Read the skill \"{}\"", skill.name), picture: None },
+                None => {
+                    let names: Vec<String> = crate::skills::all().into_iter().map(|s| s.name).collect();
+                    Outcome::err(format!("no skill `{name}`; there are: {}", names.join(", ")), "Looked for a skill".into())
+                }
+            }
+        }
         "render" => match render(s, args) {
             Ok((v, url)) => Outcome { picture: Some(url), ..Outcome::ok(v, "Looked at the drawing".into()) },
             Err(e) => Outcome::err(e, "Could not make a picture".into()),

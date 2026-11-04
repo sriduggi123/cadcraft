@@ -37,6 +37,16 @@ dimensions follow the dimension style.
 Answer in short plain sentences: say what you did, with the numbers that matter (sizes, \
 positions, counts). Don't list handles unless asked.";
 
+/// The instructions sent first in every request: [`SYSTEM`] and the skills' list (the same for
+/// every request of a build, so the provider can cache it).
+pub fn system() -> String {
+    format!(
+        "{SYSTEM}\n\nSkills: playbooks for kinds of requests. When a request fits one, call load_skill with its name \
+first and follow it:\n{}",
+        crate::skills::index()
+    )
+}
+
 /// The drawing now, compact: title, units, extents, counts, layers, current layer, selection.
 pub fn drawing_now(s: &mut Session) -> String {
     let summary = s.execute("drawing.inspect", &json!({"entities": false})).unwrap_or(Value::Null);
