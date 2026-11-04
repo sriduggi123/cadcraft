@@ -475,7 +475,8 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         }
         #[cfg(not(target_arch = "wasm32"))]
         "ui.updates.check" => {
-            crate::updates_ui::check_now(app);
+            // Upstream's releases have no multiplayer, so this build does not offer them.
+            app.session.echo(crate::tl!("This multiplayer build is updated from its own branch, not from CADCraft releases."));
             Ok(Value::Null)
         }
         "ui.dialog.close" => {
