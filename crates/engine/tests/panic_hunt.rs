@@ -94,13 +94,24 @@ fn adversarial() -> Vec<Value> {
     ]
 }
 
+/// The hunt must not reach the network either: `cloud.share` without a `server` makes a file on
+/// the default cloud server, so it gets a local port nothing listens on.
+fn offline(id: &str, p: &Value) -> Value {
+    if id != "cloud.share" {
+        return p.clone();
+    }
+    let mut p = p.as_object().cloned().unwrap_or_default();
+    p.insert("server".into(), json!("127.0.0.1:1"));
+    Value::Object(p)
+}
+
 #[test]
 fn no_command_panics_or_hangs_on_adversarial_params() {
     let params = adversarial();
     let mut bad: Vec<String> = Vec::new();
     for spec in command_specs() {
         for p in &params {
-            if let Err(why) = run_guarded(spec.id, p) {
+            if let Err(why) = run_guarded(spec.id, &offline(spec.id, p)) {
                 let shown: String = p.to_string().chars().take(120).collect();
                 bad.push(format!("{} [{why}] <- {shown}", spec.id));
                 break;
