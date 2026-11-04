@@ -83,7 +83,7 @@ impl Net {
                 let out = self.server.batch(id, batch, base, changes);
                 self.route(out);
             }
-            ClientMsg::List { .. } => {}
+            ClientMsg::List { .. } | ClientMsg::Ai { .. } => {}
             ClientMsg::Lock { block, on } => {
                 let id = self.members[i].id.unwrap();
                 let out = self.server.lock(id, &block, on);

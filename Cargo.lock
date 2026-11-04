@@ -652,6 +652,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadcraft-ai"
+version = "0.17.0"
+dependencies = [
+ "cadcraft-collab",
+ "cadcraft-collab-net",
+ "cadcraft-engine",
+ "serde_json",
+ "web-time",
+]
+
+[[package]]
 name = "cadcraft-cli"
 version = "0.17.0"
 dependencies = [
@@ -831,6 +842,7 @@ dependencies = [
 name = "cadcraft-server"
 version = "0.17.0"
 dependencies = [
+ "cadcraft-ai",
  "cadcraft-collab",
  "cadcraft-doc",
  "cadcraft-engine",
@@ -845,6 +857,7 @@ dependencies = [
 name = "cadcraft-ui-egui"
 version = "0.17.0"
 dependencies = [
+ "cadcraft-ai",
  "cadcraft-color",
  "cadcraft-doc",
  "cadcraft-engine",

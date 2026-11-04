@@ -1485,3 +1485,12 @@ menu	Draw	绘图
 menu	Modify	修改
 menu	View	视图
 	This multiplayer build is updated from its own branch, not from CADCraft releases.	此多人协作版本从其自身分支更新，而非 CADCraft 发行版。
+	AI Assistant...	AI 助手...
+	AI Assistant	AI 助手
+	Thinking…	正在思考…
+	Send	发送
+	Stop	停止
+	New Chat	新对话
+	Start over; the drawing keeps its changes	重新开始；图形保留已做的更改
+	Message the assistant (Enter sends, Shift+Enter for a new line)	给助手发消息（按 Enter 发送，Shift+Enter 换行）
+	Ask about the drawing, or ask for a change: “dimension the plate”, “move the text on layer Notes to Annotation”.	询问有关图形的问题，或要求修改：“为板件标注尺寸”、“把 Notes 图层上的文字移到 Annotation 图层”。

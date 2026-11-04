@@ -43,3 +43,13 @@ People then use `cad.example.com` (or `https://cad.example.com`) as the server a
 connect over `wss://`.
 
 There are no accounts yet: anyone who can reach the server sees every file.
+
+## AI assistant (`/ai`)
+
+The apps' Tools ▸ AI Assistant… sends its chats to `/ai`; the server adds the key and the model
+and calls the provider with `curl` (8.3 or later). The key never reaches the apps.
+
+- Key: the `CADCRAFT_AI_KEY` environment variable (the systemd unit reads `/etc/cadcraft/ai.env`,
+  mode 600, a line `CADCRAFT_AI_KEY=…`). Without it the assistant is off.
+- `--ai-endpoint`: an OpenAI-compatible chat completions URL (default OpenCode Go's).
+- `--ai-model`: the model (default `muse-spark-1.3-contributor`).

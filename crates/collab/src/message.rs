@@ -28,6 +28,10 @@ pub enum ClientMsg {
     Presence(Presence),
     /// Lock block `block` while this person edits it in the Block Editor (`on`), or let it go.
     Lock { block: String, on: bool },
+    /// On `/ai`: one request to the AI model (OpenAI chat form: `messages` and `tools`), answered
+    /// by [`ServerMsg::Ai`] with the same `id`. The server holds the key and picks the model;
+    /// `conversation` is the same for every request of one chat.
+    Ai { id: u64, conversation: String, request: crate::Json },
 }
 
 /// Most selected objects a presence message carries.
@@ -98,6 +102,8 @@ pub enum ServerMsg {
     Presence { client: u32, presence: Presence },
     /// The blocks locked now, with who holds each, after any lock changes.
     Locks { locks: Vec<(String, u32)> },
+    /// The model's answer to [`ClientMsg::Ai`] `id` (OpenAI chat completion), or why there is none.
+    Ai { id: u64, reply: std::result::Result<crate::Json, String> },
 }
 
 /// Encode a message for the wire.

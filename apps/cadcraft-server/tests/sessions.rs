@@ -101,7 +101,7 @@ fn session_names_are_checked() {
 #[test]
 fn a_saved_session_reopens_after_everyone_left_and_after_a_restart() {
     let data = temp_dir("data");
-    let config = cadcraft_server::Config { web: None, data: Some(data.clone()) };
+    let config = cadcraft_server::Config { web: None, data: Some(data.clone()), ai: None };
     let mut a = Session::new();
     let url = share(&mut a, &format!("http://{}", start_with(config.clone())), "Asha");
     let id = url.rsplit('/').next().unwrap().to_string();
@@ -148,7 +148,7 @@ fn a_session_link_serves_the_web_app() {
     let web = temp_dir("web");
     std::fs::write(web.join("index.html"), "<p>app page</p>").unwrap();
     std::fs::write(web.join("app-1a2b.js"), "js").unwrap();
-    let addr = start_with(cadcraft_server::Config { web: Some(web.clone()), data: None });
+    let addr = start_with(cadcraft_server::Config { web: Some(web.clone()), data: None, ai: None });
     let (status, body) = get(addr, "/s/plan?name=Bo");
     assert!(status.contains("200"), "{status}");
     assert_eq!(body, b"<p>app page</p>");
@@ -163,7 +163,7 @@ fn a_session_link_serves_the_web_app() {
 #[test]
 fn files_are_shared_and_opened_by_link_only() {
     let data = temp_dir("cloud");
-    let addr = start_with(cadcraft_server::Config { web: None, data: Some(data.clone()) });
+    let addr = start_with(cadcraft_server::Config { web: None, data: Some(data.clone()), ai: None });
     let server = format!("http://{addr}");
 
     let mut a = Session::new();
@@ -326,4 +326,97 @@ fn a_dropped_connection_reconnects_and_catches_up() {
     wait(&mut b, "the line Asha drew while away", |s| model_len(s) == 3);
     a.execute("circle", &json!({"center": [20, 0], "radius": 2})).unwrap();
     wait(&mut b, "Asha's next edit", |s| model_len(s) == 4);
+}
+
+/// A pretend AI provider: answers each chat request with the next of `replies` and keeps what it
+/// was sent (headers and body).
+fn fake_provider(replies: Vec<serde_json::Value>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for (stream, reply) in listener.incoming().zip(replies) {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let lower = head.to_ascii_lowercase();
+            if lower.contains("expect: 100-continue") {
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+            }
+            let len: usize = lower.lines().find_map(|l| l.strip_prefix("content-length:")).map(|v| v.trim().parse().unwrap()).unwrap_or(0);
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            log.lock().unwrap().push((head, serde_json::from_slice(&body).unwrap()));
+            let out = reply.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len())
+                .unwrap();
+        }
+    });
+    (url, seen)
+}
+
+fn completion(message: serde_json::Value) -> serde_json::Value {
+    json!({"choices": [{"index": 0, "message": message, "finish_reason": "stop"}], "usage": {"total_tokens": 10}})
+}
+
+#[test]
+fn the_assistant_edits_the_drawing_through_the_server_which_holds_the_key() {
+    let circle = json!({"id": "call_1", "type": "function", "function": {"name": "execute",
+        "arguments": json!({"command": "circle", "params": {"center": [3, 4], "radius": 2}}).to_string()}});
+    let (endpoint, seen) = fake_provider(vec![
+        completion(json!({"role": "assistant", "content": "", "tool_calls": [circle]})),
+        completion(json!({"role": "assistant", "content": "Drew a circle of radius 2 at 3,4."})),
+    ]);
+    let ai = cadcraft_server::ai::AiConfig { endpoint, model: "test-model".into(), key: "secret-key".into() };
+    let addr = start_with(cadcraft_server::Config { web: None, data: None, ai: Some(ai) });
+    let mut s = Session::new();
+    s.execute("new", &json!({})).unwrap();
+    let mut a = cadcraft_ai::Assistant::new(&format!("ws://{addr}"));
+    a.ask(&mut s, "draw a circle");
+    let until = Instant::now() + Duration::from_secs(30);
+    while a.busy() && Instant::now() < until {
+        a.tick(&mut s);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!a.busy(), "no answer: {:?}", a.log);
+    assert_eq!(a.log.last(), Some(&cadcraft_ai::Entry::Assistant("Drew a circle of radius 2 at 3,4.".into())), "{:?}", a.log);
+    assert_eq!(model_len(&s), 1);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let (head, body) = &seen[0];
+    // The server adds the key and the model; the app sends neither.
+    assert!(head.contains("Authorization: Bearer secret-key"), "{head}");
+    assert!(head.contains("User-Agent: cadcraft-ai/"), "{head}");
+    assert!(head.contains("x-opencode-session: cadcraft-"), "{head}");
+    assert_eq!(body["model"], "test-model");
+    assert!(body["tools"].as_array().is_some_and(|t| !t.is_empty()));
+    // The second request carries the tool's result.
+    let msgs = seen[1].1["messages"].as_array().unwrap();
+    assert_eq!(msgs.last().unwrap()["tool_call_id"], "call_1");
+}
+
+#[test]
+fn without_a_key_the_server_says_the_assistant_is_off() {
+    let addr = start_with(cadcraft_server::Config::default());
+    let mut s = Session::new();
+    s.execute("new", &json!({})).unwrap();
+    let mut a = cadcraft_ai::Assistant::new(&format!("ws://{addr}"));
+    a.ask(&mut s, "hello");
+    let until = Instant::now() + Duration::from_secs(10);
+    while a.busy() && Instant::now() < until {
+        a.tick(&mut s);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(a.log.last(), Some(&cadcraft_ai::Entry::Error("this server has no AI set up".into())));
 }

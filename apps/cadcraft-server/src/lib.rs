@@ -12,6 +12,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod ai;
 pub mod http;
 
 use std::collections::HashMap;
@@ -54,6 +55,8 @@ struct Room {
 pub struct Config {
     pub web: Option<PathBuf>,
     pub data: Option<PathBuf>,
+    /// The AI provider for `/ai` (none: the assistant is off on this server).
+    pub ai: Option<ai::AiConfig>,
 }
 
 #[derive(Clone, Default)]
@@ -257,10 +260,10 @@ fn connection(mut stream: TcpStream, rooms: &Rooms) -> Result<(), String> {
     }
     let mut name = None;
     let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES)).max_frame_size(Some(MAX_MESSAGE_BYTES));
-    // `/new` makes a cloud file and `/status` answers about files by id; neither is a name a file
-    // can have.
+    // `/new` makes a cloud file, `/status` answers about files by id and `/ai` is the assistant;
+    // none is a name a file can have.
     let callback = |req: &Request, resp: Response| match session_name(req.uri().path())
-        .or_else(|| matches!(req.uri().path(), NEW | STATUS).then(|| req.uri().path().to_string()))
+        .or_else(|| matches!(req.uri().path(), NEW | STATUS | ai::AI).then(|| req.uri().path().to_string()))
     {
         Some(n) => {
             name = Some(n);
@@ -355,6 +358,20 @@ fn handle(rooms: &Rooms, name: &mut String, client: &mut Option<u32>, tx: &Sende
             Ok(())
         }
         (ClientMsg::Hello { .. }, None) if name == STATUS => refuse(tx, "open a file by its link"),
+        (ClientMsg::Ai { id, conversation, request }, None) if name == ai::AI => {
+            let Some(cfg) = rooms.config.ai.clone() else {
+                let _ = message::encode(&ServerMsg::Ai { id, reply: Err("this server has no AI set up".into()) }).map(|b| tx.send(b));
+                return Ok(());
+            };
+            // The answer takes seconds; the connection keeps moving messages meanwhile.
+            let tx = tx.clone();
+            let _ = std::thread::Builder::new().name("ai-request".into()).spawn(move || {
+                let reply = ai::ask(&cfg, &conversation, &request.0).map(cadcraft_collab::Json);
+                let _ = message::encode(&ServerMsg::Ai { id, reply }).map(|b| tx.send(b));
+            });
+            Ok(())
+        }
+        (_, None) if name == ai::AI => refuse(tx, "this connection is for AI requests"),
         (ClientMsg::Hello { name: who, seed, title, .. }, None) if name == NEW => {
             let Some(seed) = seed else { return refuse(tx, "a new file needs a drawing") };
             let id = new_id()?;

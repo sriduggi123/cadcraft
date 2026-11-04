@@ -18,6 +18,13 @@ struct Args {
     /// Without it, a session ends when its last person leaves.
     #[arg(long)]
     data: Option<std::path::PathBuf>,
+    /// The AI provider's OpenAI-compatible chat endpoint for the assistant (`/ai`). The assistant
+    /// is on only when the key is in the `CADCRAFT_AI_KEY` environment variable.
+    #[arg(long, default_value = cadcraft_server::ai::DEFAULT_ENDPOINT)]
+    ai_endpoint: String,
+    /// The model the assistant uses.
+    #[arg(long, default_value = cadcraft_server::ai::DEFAULT_MODEL)]
+    ai_model: String,
 }
 
 fn main() {
@@ -30,7 +37,13 @@ fn main() {
         }
     };
     eprintln!("cadcraft-server: listening on ws://{}/s/<session>", args.listen);
-    let rooms = cadcraft_server::Rooms::new(cadcraft_server::Config { web: args.web, data: args.data });
+    let key = std::env::var(cadcraft_server::ai::KEY_VAR).ok().filter(|k| !k.trim().is_empty());
+    let ai = key.map(|key| cadcraft_server::ai::AiConfig { endpoint: args.ai_endpoint, model: args.ai_model, key: key.trim().to_string() });
+    match &ai {
+        Some(a) => eprintln!("cadcraft-server: AI assistant on /ai with {}", a.model),
+        None => eprintln!("cadcraft-server: AI assistant off (no {})", cadcraft_server::ai::KEY_VAR),
+    }
+    let rooms = cadcraft_server::Rooms::new(cadcraft_server::Config { web: args.web, data: args.data, ai });
     if let Err(e) = cadcraft_server::serve(listener, rooms) {
         eprintln!("cadcraft-server: {e}");
         std::process::exit(1);

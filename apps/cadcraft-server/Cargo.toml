@@ -23,8 +23,9 @@ cadcraft-doc = { workspace = true }
 cadcraft-io = { workspace = true }
 clap = { workspace = true }
 getrandom = "0.3"
+serde_json = { workspace = true }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 cadcraft-engine = { workspace = true }
-serde_json = { workspace = true }
+cadcraft-ai = { workspace = true }

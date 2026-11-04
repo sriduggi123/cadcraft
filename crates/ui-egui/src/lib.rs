@@ -17,6 +17,7 @@ pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
     ..craft_update::suite::CADCRAFT
 };
 
+pub mod ai_panel;
 pub mod aliasdlg;
 pub mod animation;
 pub mod autosave;
@@ -324,6 +325,7 @@ pub struct CadApp {
     pub updates_rt: updates_ui::Runtime,
     /// The Cloud Files dialog ([`cloud`]).
     pub cloud: cloud::State,
+    pub ai: ai_panel::State,
 }
 
 impl CadApp {
@@ -382,6 +384,7 @@ impl CadApp {
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
             cloud: cloud::State::default(),
+            ai: ai_panel::State::default(),
         }
     }
 
@@ -709,6 +712,7 @@ impl CadApp {
         // A shared session's incoming edits, between commands; poll while one is live.
         self.session.collab_tick();
         cloud::tick(self, ctx);
+        ai_panel::tick(self, ctx);
         if self.session.collab_live() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -926,6 +930,7 @@ impl CadApp {
         updates_ui::show(self, ui.ctx());
         dialogs::show(self, ui.ctx());
         cloud::show(self, ui.ctx());
+        ai_panel::show(self, ui.ctx());
         palettes::patterns::prompt_picker(self, ui.ctx());
         closing::prompt(self, ui.ctx());
         save_loss::prompt(self, ui.ctx());

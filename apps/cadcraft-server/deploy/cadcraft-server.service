@@ -7,6 +7,8 @@ After=network.target
 [Service]
 User=cadcraft
 Group=cadcraft
+# The AI assistant's key (CADCRAFT_AI_KEY=…), readable by root only; without it the assistant is off.
+EnvironmentFile=-/etc/cadcraft/ai.env
 ExecStart=/opt/cadcraft/cadcraft-server --listen 127.0.0.1:9010 --data /var/lib/cadcraft --web /opt/cadcraft/web
 Restart=on-failure
 RestartSec=2

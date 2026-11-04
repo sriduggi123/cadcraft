@@ -17,6 +17,7 @@ const RECENT_CLEAR: &str = "ui.recent.clear";
 
 /// UI-only commands: (id, label, menu path, shortcut).
 pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    ("ui.ai", "AI Assistant...", &["Tools", "AI Assistant..."], None),
     ("ui.spacemouse", "3D Mouse...", &["Tools", "3D Mouse..."], None),
     ("ui.spacemouse.calibrate", "Calibrate 3D Mouse", &[], None),
     ("ui.spacemouse.navigate", "3D Mouse Navigation", &[], None),
@@ -95,6 +96,9 @@ fn route_ui_subsystems(app: &mut CadApp, id: &str, params: &Value) -> Option<Res
         return Some(result);
     }
     if let Some(r) = crate::cloud::route(app, id, params) {
+        return Some(r);
+    }
+    if let Some(r) = crate::ai_panel::route(app, id, params) {
         return Some(r);
     }
     if let Some(r) = crate::xrefs::route(app, id, params) {
