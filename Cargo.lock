@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-collab"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "cadcraft-doc",
  "postcard",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-collab-net"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "cadcraft-collab",
  "js-sys",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "cadcraft-server"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "cadcraft-collab",
  "cadcraft-doc",
