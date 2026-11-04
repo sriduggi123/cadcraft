@@ -658,6 +658,7 @@ dependencies = [
  "cadcraft-collab",
  "cadcraft-collab-net",
  "cadcraft-engine",
+ "cadcraft-io",
  "serde_json",
  "web-time",
 ]
@@ -695,6 +696,7 @@ version = "0.17.0"
 dependencies = [
  "cadcraft-collab",
  "js-sys",
+ "rustls",
  "tungstenite",
  "wasm-bindgen",
  "web-sys",

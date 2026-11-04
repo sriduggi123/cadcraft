@@ -13,6 +13,9 @@ cadcraft-collab = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# rustls's crypto provider, chosen here: without one, a `wss://` connection panics unless another
+# crate in the program happens to enable it (MIT OR Apache-2.0 OR ISC; ring is already in the tree).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # The browser's own WebSocket (src/web.rs).
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -15,3 +15,7 @@ cadcraft-collab = { workspace = true }
 cadcraft-collab-net = { workspace = true }
 serde_json = { workspace = true }
 web-time = { workspace = true }
+
+[dev-dependencies]
+# The example opens DXF/DWG files.
+cadcraft-io = { workspace = true }
