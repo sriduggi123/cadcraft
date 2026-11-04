@@ -432,7 +432,8 @@ impl Session {
             st.revision += 1;
         }
         let Some([x, y, h]) = lead.view else { return };
-        let v = View { center: Vec2::new(x, y), height: h };
+        // Presence carries no view twist yet; the follower keeps its own.
+        let v = View { center: Vec2::new(x, y), height: h, twist: st.view().twist };
         if !same_view(&v, &st.view()) {
             st.set_view_quiet(v);
         }

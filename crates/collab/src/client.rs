@@ -264,7 +264,7 @@ impl Client {
 }
 
 /// Copy what never syncs from `from` to `to`: per-person variables, the handle seed and
-/// session-only data (hidden objects, REFEDIT, read notes).
+/// session-only data (hidden objects, REFEDIT, read notes, loaded image pixels).
 pub fn carry_local(from: &Drawing, to: &mut Drawing) {
     to.handseed = from.handseed;
     to.header.vars.retain(|k, _| !vars::is_local(k));
@@ -274,4 +274,5 @@ pub fn carry_local(from: &Drawing, to: &mut Drawing) {
     to.refedit = from.refedit.clone();
     to.skipped_records = from.skipped_records.clone();
     to.portable_fonts = from.portable_fonts;
+    to.rasters = from.rasters.clone();
 }

@@ -105,6 +105,7 @@ fn body(d: &Drawing) -> Body {
         refedit: _,
         skipped_records: _,
         portable_fonts: _,
+        rasters: _,
     } = d;
     Body {
         header: header.clone(),
@@ -179,6 +180,7 @@ fn drawing(b: Body) -> Drawing {
         refedit: None,
         skipped_records: Default::default(),
         portable_fonts: false,
+        rasters: Default::default(),
     }
 }
 
