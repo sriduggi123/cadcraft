@@ -1,0 +1,50 @@
+# Multiplayer fork only: builds the Windows x64 installer (.msi) and portable .zip from the
+# `multiplayer` branch with packaging/windows/package.ps1, unsigned, and keeps them as the run's
+# artifacts. Upstream's release.yml (signed, all platforms) is unchanged.
+name: Multiplayer Windows
+
+on:
+  push:
+    branches: [multiplayer]
+  workflow_dispatch:
+
+concurrency:
+  group: multiplayer-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: craft-fonts (the same fonts the release builds embed)
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: WiX
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+      - name: Package
+        shell: pwsh
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}\craft-fonts
+        run: pwsh packaging/windows/package.ps1 -Arch x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-windows-x64
+          path: |
+            dist/release/*.msi
+            dist/release/*.zip
+          if-no-files-found: error
