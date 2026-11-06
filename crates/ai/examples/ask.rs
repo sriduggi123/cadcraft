@@ -1,5 +1,5 @@
 //! Ask the assistant from a terminal, against a drawing in memory:
-//! `cargo run -p cadcraft-ai --example ask -- [--server wss://host] [--open file.dxf] [--yes] "request"`.
+//! `cargo run -p cadcraft-ai --example ask -- [--server wss://host] [--open file.dxf] [--dump chat.json] [--yes] "request"`.
 //! Prints the chat as it goes and the entity counts at the end. `--yes` allows what the assistant
 //! asks to do; its questions are answered from the keyboard; picks in the drawing are cancelled.
 
@@ -17,6 +17,7 @@ fn main() {
     };
     let server = take("--server").unwrap_or_else(|| cadcraft_engine::cmd::collab::DEFAULT_SERVER.to_string());
     let open = take("--open");
+    let dump = take("--dump");
     let yes = args.iter().position(|a| a == "--yes").map(|i| args.remove(i)).is_some();
     let prompt = args.join(" ");
     if prompt.trim().is_empty() {
@@ -82,5 +83,11 @@ fn main() {
     println!("counts: {}", summary["counts"]);
     if let Ok(st) = s.state() {
         println!("undo: {:?}", st.undo.iter().map(|u| u.label.as_str()).collect::<Vec<_>>());
+    }
+    if let Some(path) = dump {
+        let text = serde_json::to_string_pretty(a.transcript()).unwrap_or_default();
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("can't write {path}: {e}");
+        }
     }
 }

@@ -119,6 +119,8 @@ pub struct Assistant {
     pictures: Vec<String>,
     /// The user allowed LISP routines for this chat.
     lisp_ok: bool,
+    /// When the request in progress began.
+    started: Option<Instant>,
 }
 
 /// An id for one chat, for the provider's session header: the time and a counter (not secret).
@@ -185,6 +187,7 @@ impl Assistant {
             calls: VecDeque::new(),
             pictures: Vec::new(),
             lisp_ok: false,
+            started: None,
         }
     }
 
@@ -205,6 +208,16 @@ impl Assistant {
     /// Whether a request is in progress (also while it waits for the user).
     pub fn busy(&self) -> bool {
         !matches!(self.state, State::Idle)
+    }
+
+    /// The chat as the model sees it (OpenAI messages, without the instructions), for debugging.
+    pub fn transcript(&self) -> &[Value] {
+        &self.messages
+    }
+
+    /// How long the request in progress has run, and how many replies the model has sent for it.
+    pub fn working(&self) -> Option<(Duration, usize)> {
+        self.started.map(|t| (t.elapsed(), self.rounds))
     }
 
     /// What the request waits for from the user, if anything.
@@ -237,6 +250,7 @@ impl Assistant {
             self.trim();
         }
         self.rounds = 0;
+        self.started = Some(Instant::now());
         // One undo step for everything this request changes.
         if let Ok(st) = s.state_mut() {
             st.begin_undo_group();
@@ -274,6 +288,7 @@ impl Assistant {
     }
 
     fn finish(&mut self, s: &mut Session) {
+        self.started = None;
         let Some((start, label)) = self.undo.take() else { return };
         if let Ok(st) = s.state_mut() {
             // The group's steps are now one, at the place the group began.
@@ -295,9 +310,9 @@ impl Assistant {
 
     /// The chat as sent: only the latest picture is kept, older ones become a note (each costs
     /// thousands of tokens on every request).
-    fn outgoing(&self) -> Vec<Value> {
+    fn outgoing(&self, s: &Session) -> Vec<Value> {
         let last_picture = self.messages.iter().rposition(|m| m["content"].is_array());
-        let mut out = vec![json!({"role": "system", "content": prompt::system()})];
+        let mut out = vec![json!({"role": "system", "content": prompt::system(s)})];
         for (i, m) in self.messages.iter().enumerate() {
             if m["content"].is_array() && Some(i) != last_picture {
                 out.push(json!({"role": "user", "content": "[an earlier picture of the drawing, no longer shown]"}));
@@ -310,7 +325,7 @@ impl Assistant {
 
     /// Send the chat as it is now.
     fn send(&mut self, s: &mut Session) {
-        let messages = self.outgoing();
+        let messages = self.outgoing(s);
         let Some(link) = self.link.as_mut().filter(|l| l.is_open()) else {
             self.link = None;
             self.queued = true;
@@ -431,6 +446,10 @@ impl Assistant {
         }
         if calls.is_empty() {
             self.state = State::Idle;
+            if let Some((took, replies)) = self.working() {
+                let line = format!("Done in {:.0} s ({} repl{})", took.as_secs_f64(), replies + 1, if replies == 0 { "y" } else { "ies" });
+                self.log.push(Entry::Tool { line, ok: true });
+            }
             self.finish(s);
             return;
         }

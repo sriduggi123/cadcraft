@@ -104,7 +104,8 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
                 if busy && need.is_none() {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(crate::tl!("Thinking…"));
+                        let secs = assistant.working().map_or(0, |(t, _)| t.as_secs());
+                        ui.label(format!("{} {secs} s", crate::tl!("Working…")));
                     });
                 }
             });

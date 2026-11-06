@@ -389,7 +389,10 @@ fn the_assistant_edits_the_drawing_through_the_server_which_holds_the_key() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!a.busy(), "no answer: {:?}", a.log);
-    assert_eq!(a.log.last(), Some(&cadcraft_ai::Entry::Assistant("Drew a circle of radius 2 at 3,4.".into())), "{:?}", a.log);
+    // The answer, then how long the request took.
+    let answer = a.log.iter().rev().find(|e| matches!(e, cadcraft_ai::Entry::Assistant(_)));
+    assert_eq!(answer, Some(&cadcraft_ai::Entry::Assistant("Drew a circle of radius 2 at 3,4.".into())), "{:?}", a.log);
+    assert!(matches!(a.log.last(), Some(cadcraft_ai::Entry::Tool { line, ok: true }) if line.starts_with("Done in")), "{:?}", a.log);
     assert_eq!(model_len(&s), 1);
 
     let seen = seen.lock().unwrap();

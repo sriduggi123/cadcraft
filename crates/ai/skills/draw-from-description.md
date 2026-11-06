@@ -19,5 +19,7 @@ when: The user describes something to draw in words: a plate with holes, a room,
    - walls: `pline` for the centre line, then `offset` both ways
 5. Layers: outlines on the current or an `Outline`/`Visible` layer, centre lines on `Center`
    if it exists.
-6. `render` the result and compare with the description; fix and say what was drawn with its
-   main sizes.
+6. Draw it all in one `run_commands` call: layers first, then the geometry. A fillet or offset
+   of a polyline drawn in the same call uses `"$N"` for its handle.
+7. `render` the result once and compare with the description; fix and say what was drawn with
+   its main sizes.

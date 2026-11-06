@@ -44,12 +44,12 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("dimradius", "Radius", run_radius)
             .menu(&["Dimension", "Radius"])
             .alias(&["dra", "dimrad"])
-            .params("{handle, at?} | {center, point}")
+            .params("{handle, at?, text?} | {center, point, text?} (text: \"4X <>\", <> = the measured value)")
             .interactive(|_| Ok(Box::new(RadialM::new(false)))),
         CommandSpec::new("dimdiameter", "Diameter", run_diameter)
             .menu(&["Dimension", "Diameter"])
             .alias(&["ddi", "dimdia"])
-            .params("{handle, at?} | {center, point}")
+            .params("{handle, at?, text?} | {center, point, text?} (text: \"4X <>\", <> = the measured value)")
             .interactive(|_| Ok(Box::new(RadialM::new(true)))),
         CommandSpec::new("dimangular", "Angular", run_angular)
             .menu(&["Dimension", "Angular"])

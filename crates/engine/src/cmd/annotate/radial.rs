@@ -1,5 +1,7 @@
 use super::common::{DimText, add_dim, circle_of, dim, pick_at, text_at};
-use super::{Accept, DimKind, EntityKind, Input, Interactive, Prompt, Result, Session, Step, Value, Vec2, bad, json, point_param, targets};
+use super::{
+    Accept, DimKind, EntityKind, Input, Interactive, Prompt, Result, Session, Step, Value, Vec2, bad, json, point_param, str_param, targets,
+};
 
 fn radial(s: &mut Session, p: &Value, diameter: bool) -> Result<Value> {
     let id = if diameter { "dimdiameter" } else { "dimradius" };
@@ -15,10 +17,12 @@ fn radial(s: &mut Session, p: &Value, diameter: bool) -> Result<Value> {
     if c.near(pt, 1e-12) {
         return Err(bad(id, "`point` must differ from `center`"));
     }
+    // `text` as for linear dimensions: "4X <>" puts "4X " before the measured value.
+    let text = str_param(p, "text").unwrap_or("");
     let k = if diameter {
-        dim(s, DimKind::Diameter, c + (c - pt), Vec2::ZERO, Vec2::ZERO, pt, "")
+        dim(s, DimKind::Diameter, c + (c - pt), Vec2::ZERO, Vec2::ZERO, pt, text)
     } else {
-        dim(s, DimKind::Radius, c, Vec2::ZERO, Vec2::ZERO, pt, "")
+        dim(s, DimKind::Radius, c, Vec2::ZERO, Vec2::ZERO, pt, text)
     };
     let k = match at {
         Some(at) => text_at(k, at),

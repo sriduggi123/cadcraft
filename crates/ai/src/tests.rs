@@ -90,8 +90,10 @@ fn a_request_runs_the_tools_the_model_asks_for_and_is_one_undo_step() {
             Entry::Tool { line: "Ran CIRCLE".into(), ok: true },
             Entry::Tool { line: "Ran CIRCLE".into(), ok: true },
             Entry::Assistant("Two circles of radius 2 at 0,0 and 10,0.".into()),
+            Entry::Tool { line: "Done in 0 s (2 replies)".into(), ok: true },
         ]
     );
+    assert!(a.working().is_none());
     let st = s.state().unwrap();
     assert_eq!(st.undo.len(), 1, "one undo step for the request");
     assert_eq!(st.undo[0].label, "AI: draw two circles");
@@ -319,7 +321,7 @@ fn printed_point_lists_are_read() {
 fn every_skill_file_reads_and_is_in_the_prompt() {
     let all = crate::skills::all();
     assert_eq!(all.len(), 8, "a skill file has a bad header: {:?}", all.iter().map(|s| &s.name).collect::<Vec<_>>());
-    let system = crate::prompt::system();
+    let system = crate::prompt::system(&Session::new());
     for s in &all {
         assert!(system.contains(&format!("- {}: ", s.name)), "{}", s.name);
         assert!(s.body.starts_with("# "), "{}: {:?}", s.name, s.body.chars().take(20).collect::<String>());
@@ -347,4 +349,75 @@ fn a_line_the_model_repeats_is_shown_once() {
         a.tick(&mut s);
     }
     assert_eq!(a.log.iter().filter(|e| **e == Entry::Assistant("Checking.".into())).count(), 1);
+}
+
+#[test]
+fn run_commands_runs_typed_lines_and_commands_in_one_reply() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "a plate with a hole");
+    let steps = json!({"steps": [
+        {"line": "line 0,0 100,0 100,60 0,60 c"},
+        {"command": "circle", "params": {"center": [10, 10], "radius": 4}},
+        {"line": "circle 90,10 4"},
+        {"command": "circle", "params": {"center": [50, 30], "radius": 1}},
+        {"command": "erase", "params": {"handles": ["$4"]}},
+    ]});
+    model_calls(&mut a, &mut s, &wire, "run_commands", steps);
+    assert_eq!(circles(&s), 2, "the step that refers to $4 erased what step 4 drew");
+    let lines = s.state().unwrap().doc.model.iter().filter(|e| matches!(e.kind, cadcraft_engine::doc::EntityKind::Line(_))).count();
+    assert_eq!(lines, 4);
+    let result: Value = serde_json::from_str(&last_result(&wire)).unwrap();
+    assert_eq!(result["done"], 5);
+    assert_eq!(result["results"].as_array().unwrap().len(), 5);
+    assert!(matches!(a.log.last(), Some(Entry::Tool { ok: true, line }) if line == "Ran 5 steps (LINE, CIRCLE, ERASE)"), "{:?}", a.log.last());
+}
+
+#[test]
+fn run_commands_stops_at_the_first_failing_step() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "circles");
+    let steps = json!({"steps": [
+        {"command": "circle", "params": {"center": [0, 0], "radius": 2}},
+        {"command": "no-such-command", "params": {}},
+        {"command": "circle", "params": {"center": [10, 0], "radius": 2}},
+        {"oops": 1},
+    ]});
+    model_calls(&mut a, &mut s, &wire, "run_commands", steps);
+    assert_eq!(circles(&s), 1, "nothing after the failing step runs");
+    let result: Value = serde_json::from_str(&last_result(&wire)).unwrap();
+    assert_eq!((result["done"].as_u64(), result["stopped"].as_u64(), result["of"].as_u64()), (Some(1), Some(2), Some(4)));
+    assert!(matches!(a.log.last(), Some(Entry::Tool { ok: false, .. })));
+    assert!(tools::run(&mut s, "run_commands", &json!({"steps": []})).result.starts_with("error"));
+    let many: Vec<Value> = (0..=tools::MAX_STEPS).map(|_| json!({"line": "circle 0,0 1"})).collect();
+    assert!(!tools::run(&mut s, "run_commands", &json!({ "steps": many })).ok);
+    assert_eq!(circles(&s), 1, "too many steps run none");
+}
+
+#[test]
+fn a_batch_with_a_risky_step_asks_once_and_a_no_runs_none_of_it() {
+    let (mut s, mut a, wire) = setup();
+    a.ask(&mut s, "draw and save");
+    let steps = json!({"steps": [
+        {"command": "circle", "params": {"center": [0, 0], "radius": 2}},
+        {"command": "qsave", "params": {}},
+    ]});
+    assert!(tools::permission(&s, "run_commands", &json!({"steps": [{"line": "circle 0,0 2"}]}), false).is_none());
+    model_calls(&mut a, &mut s, &wire, "run_commands", steps);
+    match a.need() {
+        Some(Need::Confirm { what, .. }) => assert!(what.contains("QSAVE"), "{what}"),
+        other => panic!("expected a question, got {other:?}"),
+    }
+    a.answer(&mut s, Answer::Deny);
+    assert_eq!(circles(&s), 0);
+    assert!(last_result(&wire).contains("the user said no"));
+}
+
+#[test]
+fn the_common_commands_in_the_prompt_all_exist() {
+    let system = crate::prompt::system(&Session::new());
+    for id in ["line", "rectang", "circle", "layer.new", "dimlinear", "dimdiameter", "mleader", "trim"] {
+        assert!(system.contains(&format!("\n- {id}: {{")), "{id} is missing from the prompt");
+    }
+    let listed = system.lines().filter(|l| l.starts_with("- ") && l.contains(": {")).count();
+    assert_eq!(listed, 27, "a command in prompt::COMMON was renamed or removed");
 }

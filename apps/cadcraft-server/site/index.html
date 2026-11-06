@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADCraft Multiplayer</title>
+<meta name="description" content="Open-source CAD that runs on your Mac, Windows or in the browser, with live multiplayer drawing and an AI assistant that works on your drawing.">
+<link rel="icon" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #f3f1ea;
+  --paper-2: #e9e6dc;
+  --ink: #15191d;
+  --ink-2: #4a5058;
+  --rule: #c9c4b6;
+  --grid: rgba(20, 163, 199, .10);
+  --grid-major: rgba(20, 163, 199, .20);
+  --blue: #0b6f88;
+  --cyan: #14a3c7;
+  --red: #d9482b;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0f1418; --paper-2: #161d22; --ink: #e6e9ea; --ink-2: #9aa3a9; --rule: #2c363d;
+    --grid: rgba(20, 163, 199, .08); --grid-major: rgba(20, 163, 199, .16); --blue: #4fc3e0; --red: #f07a3a;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; color: var(--ink); font: 16px/1.55 var(--sans);
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid-major) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+}
+a { color: inherit; }
+.sheet { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+.mono, .tag, .label { font-family: var(--mono); }
+.label { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
+
+/* top strip */
+header.top { border-bottom: 1px solid var(--ink); background: var(--paper); position: sticky; top: 0; z-index: 5; }
+header.top .sheet { display: flex; align-items: center; gap: 24px; height: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; text-decoration: none; letter-spacing: -.01em; }
+.brand img { width: 26px; height: 26px; }
+.brand span { font-family: var(--mono); font-weight: 500; font-size: 11px; color: var(--ink-2); letter-spacing: .12em; border: 1px solid var(--rule); padding: 2px 6px; }
+nav.index { margin-left: auto; display: flex; gap: 22px; font-family: var(--mono); font-size: 12px; }
+nav.index a { text-decoration: none; color: var(--ink-2); }
+nav.index a b { color: var(--ink); font-weight: 500; }
+nav.index a:hover b { color: var(--blue); }
+.btn { display: inline-flex; align-items: center; gap: 10px; font: 500 14px var(--mono); text-decoration: none;
+  padding: 12px 18px; border: 1.5px solid var(--ink); background: var(--ink); color: var(--paper); }
+.btn:hover { background: var(--blue); border-color: var(--blue); }
+.btn.ghost { background: transparent; color: var(--ink); }
+.btn.ghost:hover { background: var(--ink); color: var(--paper); }
+.btn.small { padding: 7px 12px; font-size: 12px; }
+
+/* sheet frame: each section is a drawing sheet with a number */
+section { border-bottom: 1px solid var(--ink); position: relative; }
+.frame-head { display: flex; justify-content: space-between; align-items: baseline; padding: 18px 0 0; }
+.frame-head .no { font: 500 12px var(--mono); border: 1px solid var(--ink); padding: 3px 8px; background: var(--paper); }
+h1, h2, h3 { letter-spacing: -.02em; line-height: 1.08; margin: 0; }
+h1 { font-size: clamp(40px, 6.4vw, 84px); font-weight: 700; }
+h2 { font-size: clamp(30px, 4vw, 48px); font-weight: 700; }
+h3 { font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+p.lead { font-size: 19px; color: var(--ink-2); max-width: 640px; }
+
+/* hero */
+.hero { padding: 40px 0 56px; display: grid; grid-template-columns: 1.05fr 1fr; gap: 48px; align-items: center; }
+.hero h1 em { font-style: normal; color: var(--blue); }
+.hero .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.hero .note { margin-top: 14px; font: 12px var(--mono); color: var(--ink-2); }
+.figure { border: 1px solid var(--ink); background: var(--paper); position: relative; }
+.figure .cap { display: flex; justify-content: space-between; border-top: 1px solid var(--ink); padding: 6px 10px; font: 11px var(--mono); color: var(--ink-2); }
+.figure svg { display: block; width: 100%; height: auto; }
+.figure img { display: block; width: 100%; height: auto; }
+.corner { position: absolute; width: 14px; height: 14px; border: 0 solid var(--red); }
+.corner.tl { top: -7px; left: -7px; border-top-width: 2px; border-left-width: 2px; }
+.corner.br { bottom: -7px; right: -7px; border-bottom-width: 2px; border-right-width: 2px; }
+
+/* data strip */
+.strip { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--ink); }
+.strip div { padding: 16px 18px; border-right: 1px solid var(--rule); }
+.strip div:last-child { border-right: 0; }
+.strip b { display: block; font: 600 22px var(--sans); letter-spacing: -.02em; }
+
+/* feature grid */
+.body { padding-top: 36px; padding-bottom: 64px; }
+.intro { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; margin: 28px 0 40px; align-items: end; }
+.cells { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--ink); background: var(--paper); }
+.cell { padding: 22px 22px 26px; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.cell:nth-child(3n) { border-right: 0; }
+.cell:nth-last-child(-n+3) { border-bottom: 0; }
+.cell .tag { font-size: 11px; color: var(--red); letter-spacing: .1em; }
+.cell h3 { margin: 10px 0 8px; }
+.cell p { margin: 0; color: var(--ink-2); font-size: 15px; }
+.cell svg { width: 44px; height: 44px; margin-bottom: 6px; stroke: var(--ink); fill: none; stroke-width: 1.5; }
+
+/* two-up rows */
+.row { display: grid; grid-template-columns: 1fr 1.15fr; gap: 48px; align-items: start; }
+.row.flip { grid-template-columns: 1.15fr 1fr; }
+ol.steps { list-style: none; padding: 0; margin: 24px 0 0; counter-reset: s; border-top: 1px solid var(--ink); }
+ol.steps li { counter-increment: s; display: grid; grid-template-columns: 56px 1fr; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+ol.steps li::before { content: counter(s, decimal-leading-zero); font: 500 13px var(--mono); color: var(--blue); padding-top: 2px; }
+ol.steps b { display: block; font-weight: 600; }
+ol.steps span { color: var(--ink-2); font-size: 15px; }
+
+/* chat mock */
+.chat { border: 1px solid var(--ink); background: var(--paper); font-size: 14px; }
+.chat .bar { display: flex; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--ink); font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.chat .log { padding: 14px; display: grid; gap: 10px; }
+.msg { padding: 10px 12px; border: 1px solid var(--rule); max-width: 92%; }
+.msg.you { justify-self: end; background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.msg.tool { font: 12px var(--mono); color: var(--ink-2); border-style: dashed; padding: 6px 10px; }
+.msg.tool i { font-style: normal; color: var(--blue); }
+.msg.ask { border-color: var(--red); }
+.msg.ask .opts { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.msg.ask .opts span { font: 12px var(--mono); border: 1px solid var(--ink); padding: 4px 10px; }
+.msg.ask .opts span:first-child { background: var(--ink); color: var(--paper); }
+.chat .input { border-top: 1px solid var(--ink); padding: 10px 12px; font: 13px var(--mono); color: var(--ink-2); display: flex; justify-content: space-between; }
+
+/* presence mock */
+.cursor { font: 11px var(--mono); }
+
+/* downloads */
+.downloads { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--ink); background: var(--paper); margin-top: 32px; }
+.dl { padding: 24px; border-right: 1px solid var(--ink); display: flex; flex-direction: column; gap: 12px; }
+.dl:last-child { border-right: 0; }
+.dl .os { display: flex; align-items: center; gap: 12px; }
+.dl .os svg { width: 32px; height: 32px; fill: var(--ink); }
+.dl .meta { font: 12px var(--mono); color: var(--ink-2); }
+.dl .btn { justify-content: center; }
+.dl .alt { font: 12px var(--mono); }
+.notes { margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; font-size: 14px; color: var(--ink-2); }
+.notes b { color: var(--ink); }
+
+/* title block footer */
+footer { padding: 40px 0 48px; }
+.titleblock { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; border: 1.5px solid var(--ink); background: var(--paper); }
+.titleblock > div { padding: 10px 14px; border-right: 1px solid var(--ink); }
+.titleblock > div:last-child { border-right: 0; }
+.titleblock .label { display: block; margin-bottom: 4px; }
+.titleblock .val { font: 500 14px var(--mono); }
+.titleblock .name { font: 700 22px var(--sans); letter-spacing: -.02em; }
+.titleblock .wide { grid-column: 1 / -1; border-right: 0; border-top: 1px solid var(--ink); display: flex; flex-wrap: wrap; gap: 24px; font: 12px var(--mono); color: var(--ink-2); }
+
+@media (max-width: 900px) {
+  nav.index { display: none; }
+  .hero, .intro, .row, .row.flip, .notes { grid-template-columns: 1fr; gap: 28px; }
+  .cells, .downloads { grid-template-columns: 1fr; }
+  .cell, .dl { border-right: 0 !important; border-bottom: 1px solid var(--rule) !important; }
+  .cell:last-child, .dl:last-child { border-bottom: 0 !important; }
+  .strip { grid-template-columns: 1fr 1fr; }
+  .strip div:nth-child(2) { border-right: 0; }
+  .titleblock { grid-template-columns: 1fr 1fr; }
+  .titleblock > div { border-bottom: 1px solid var(--ink); }
+  header.top .btn { display: none; }
+}
+@media (max-width: 520px) { .sheet { padding: 0 16px; } }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="sheet">
+    <a class="brand" href="#top"><img src="icon.png" alt="">CADCraft <span>MULTIPLAYER</span></a>
+    <nav class="index" aria-label="Sheet index">
+      <a href="#features">S-101 <b>Features</b></a>
+      <a href="#multiplayer">S-201 <b>Multiplayer</b></a>
+      <a href="#ai">S-301 <b>AI Assistant</b></a>
+      <a href="#download">S-401 <b>Download</b></a>
+    </nav>
+    <a class="btn small" href="#download">Download</a>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- S-001 cover -->
+<section>
+  <div class="sheet">
+    <div class="frame-head"><span class="label">Cover sheet · Not to scale</span><span class="no">S-001</span></div>
+    <div class="hero">
+      <div>
+        <div class="label" style="margin-bottom:18px">Open-source 2D CAD · macOS · Windows · Browser</div>
+        <h1>Draw together.<br><em>Ask it to draw.</em></h1>
+        <p class="lead">A fast, open-source CAD app with the command line, snaps, layers and dimensions you know. Share a link and draw with friends live, or tell the AI assistant what you need and watch it work on your drawing.</p>
+        <div class="actions">
+          <a class="btn" href="#download">Download for free</a>
+          <a class="btn ghost" href="/app?sample">Open in browser →</a>
+        </div>
+        <div class="note">No account. Opens DXF drawings. Free for friends.</div>
+      </div>
+
+      <div class="figure">
+        <span class="corner tl"></span><span class="corner br"></span>
+        <!-- our own drawing: the 100 × 60 plate the assistant draws in the demo -->
+        <svg viewBox="0 0 560 400" role="img" aria-label="A dimensioned plate, 100 by 60, with four holes of diameter 8">
+          <defs>
+            <marker id="tick" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M2 8 L8 2" stroke="currentColor" stroke-width="1.6"/></marker>
+          </defs>
+          <g style="color:var(--blue)" stroke="currentColor" fill="none" stroke-width="1">
+            <!-- extension + dimension lines -->
+            <path d="M110 300 V352 M450 300 V352" opacity=".7"/>
+            <path d="M110 340 H450" marker-start="url(#tick)" marker-end="url(#tick)"/>
+            <path d="M110 96 H58 M110 300 H58" opacity=".7"/>
+            <path d="M70 96 V300" marker-start="url(#tick)" marker-end="url(#tick)"/>
+            <path d="M110 96 V52 M144 130 V52" opacity=".7"/>
+            <path d="M110 64 H144" marker-start="url(#tick)" marker-end="url(#tick)"/>
+          </g>
+          <g font-family="JetBrains Mono, monospace" font-size="13" fill="var(--blue)">
+            <text x="280" y="334" text-anchor="middle">100</text>
+            <text x="62" y="202" text-anchor="middle" transform="rotate(-90 62 202)">60</text>
+            <text x="127" y="58" text-anchor="middle">10</text>
+          </g>
+          <!-- centre marks -->
+          <g stroke="var(--red)" stroke-width="1" stroke-dasharray="10 4 2 4">
+            <path d="M126 130 H162 M144 112 V148 M398 130 H434 M416 112 V148 M126 266 H162 M144 248 V284 M398 266 H434 M416 248 V284"/>
+          </g>
+          <!-- part -->
+          <g stroke="var(--ink)" stroke-width="2.2" fill="none">
+            <rect x="110" y="96" width="340" height="204"/>
+            <circle cx="144" cy="130" r="13.6"/><circle cx="416" cy="130" r="13.6"/>
+            <circle cx="144" cy="266" r="13.6"/><circle cx="416" cy="266" r="13.6"/>
+          </g>
+          <!-- leader -->
+          <g stroke="var(--blue)" fill="none" stroke-width="1"><path d="M426 140 L470 180 H520"/></g>
+          <text x="474" y="174" font-family="JetBrains Mono, monospace" font-size="13" fill="var(--blue)">4X Ø8</text>
+          <!-- a friend's cursor -->
+          <g transform="translate(300 214)">
+            <path d="M0 0 L0 18 L5 13 L9 22 L12 21 L8 12 L15 12 Z" fill="var(--red)"/>
+            <rect x="16" y="16" width="52" height="18" fill="var(--red)"/>
+            <text x="22" y="29" font-family="JetBrains Mono, monospace" font-size="11" fill="#fff">Priya</text>
+          </g>
+          <!-- crosshair -->
+          <g stroke="var(--ink)" stroke-width="1" opacity=".55"><path d="M200 190 H244 M222 168 V212"/><rect x="216" y="184" width="12" height="12" fill="none"/></g>
+        </svg>
+        <div class="cap"><span>FIG. 001 — Plate, drawn and dimensioned by the assistant</span><span>ONE UNDO STEP</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="sheet"><div class="strip">
+    <div><span class="label">Engine</span><b>Pure Rust</b></div>
+    <div><span class="label">Files</span><b>DXF · DWG</b></div>
+    <div><span class="label">Together</span><b>Live, by link</b></div>
+    <div><span class="label">Assistant</span><b>Works on your drawing</b></div>
+  </div></div>
+</section>
+
+<!-- S-101 features -->
+<section id="features">
+  <div class="sheet body">
+    <div class="frame-head" style="padding:0"><span class="label">Drafting tools</span><span class="no">S-101</span></div>
+    <div class="intro">
+      <h2>The drafting tools you already know.</h2>
+      <p class="lead" style="margin:0">Type commands or click them. Every tool is a command, so the menus, the command line, scripts and the assistant all do the same thing.</p>
+    </div>
+    <div class="cells">
+      <div class="cell"><svg viewBox="0 0 44 44"><path d="M6 32 H38"/><path d="M6 12 H14"/><path d="M18 12 h20" stroke-dasharray="3 3"/><text x="6" y="24" font-size="9" font-family="JetBrains Mono" fill="currentColor" stroke="none">&gt; LINE_</text></svg><span class="tag">01 · COMMAND LINE</span><h3>Type it or click it</h3><p>LINE, CIRCLE, TRIM, OFFSET, FILLET, ARRAY and the rest, with prompts, keywords, @dx,dy and direct distance entry.</p></div>
+      <div class="cell"><svg viewBox="0 0 44 44"><circle cx="22" cy="22" r="12"/><rect x="18" y="6" width="8" height="8"/><path d="M22 2 V42 M2 22 H42" opacity=".4"/></svg><span class="tag">02 · PRECISION</span><h3>Snaps and tracking</h3><p>Endpoint, midpoint, centre, intersection, tangent and more. Polar tracking, ortho and a grid for exact geometry.</p></div>
+      <div class="cell"><svg viewBox="0 0 44 44"><path d="M6 14 L22 6 L38 14 L22 22 Z"/><path d="M6 22 L22 30 L38 22"/><path d="M6 30 L22 38 L38 30"/></svg><span class="tag">03 · ORGANISE</span><h3>Layers and blocks</h3><p>Layers with colour, linetype and lineweight. Blocks with attributes, tables and schedules.</p></div>
+      <div class="cell"><svg viewBox="0 0 44 44"><path d="M6 30 H38 M6 24 V36 M38 24 V36"/><path d="M6 10 H38 V20 H6 Z"/><path d="M10 20 L20 10 M18 20 L28 10 M26 20 L36 10"/></svg><span class="tag">04 · ANNOTATE</span><h3>Dimensions and hatches</h3><p>Linear, aligned, radius, diameter and angular dimensions, leaders, text, and hatch patterns of our own.</p></div>
+      <div class="cell"><svg viewBox="0 0 44 44"><path d="M10 4 H28 L36 12 V40 H10 Z"/><path d="M28 4 V12 H36"/><text x="13" y="30" font-size="8" font-family="JetBrains Mono" fill="currentColor" stroke="none">DXF</text></svg><span class="tag">05 · FILES</span><h3>Your drawings open</h3><p>Opens DXF and DWG drawings, saves DXF, exports PDF, SVG and PNG. Layouts, viewports and plotting.</p></div>
+      <div class="cell"><svg viewBox="0 0 44 44"><path d="M8 10 C 8 6, 14 6, 14 10 V18 C14 22, 18 22, 18 22 C18 22, 14 22, 14 26 V34 C14 38, 8 38, 8 34"/><path d="M36 10 C 36 6, 30 6, 30 10 V18 C30 22, 26 22, 26 22 C26 22, 30 22, 30 26 V34 C30 38, 36 38, 36 34"/></svg><span class="tag">06 · AUTOMATE</span><h3>LISP and scripts</h3><p>Run AutoLISP-style routines and script files. Drive the app from other programs over a control channel.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- S-201 multiplayer -->
+<section id="multiplayer">
+  <div class="sheet body">
+    <div class="frame-head" style="padding:0"><span class="label">Drawing together</span><span class="no">S-201</span></div>
+    <div class="row" style="margin-top:28px">
+      <div>
+        <h2>Share a link.<br>Draw at the same time.</h2>
+        <p class="lead">Like a shared document, but for drawings. Everyone sees each other's cursors and edits as they happen, from the desktop app or the browser.</p>
+        <ol class="steps">
+          <li><div><b>Share</b><span>File ▸ Collaborate… gives you a link. Send it to a friend.</span></div></li>
+          <li><div><b>Join</b><span>They open the link in the browser or the app. No account.</span></div></li>
+          <li><div><b>See each other</b><span>Named cursors, who is selecting what, and Follow to watch someone's view.</span></div></li>
+          <li><div><b>Keep it</b><span>The drawing stays on the server. Open it again from your cloud files at any time.</span></div></li>
+        </ol>
+      </div>
+      <div class="figure">
+        <span class="corner tl"></span><span class="corner br"></span>
+        <img src="ui-apartment.png" alt="CADCraft with an apartment floor plan open: walls, windows, doors, room names and dimensions">
+        <div class="cap"><span>FIG. 201 — Apartment plan open in CADCraft</span><span>EXAMPLES/APARTMENT.DXF</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- S-301 AI -->
+<section id="ai">
+  <div class="sheet body">
+    <div class="frame-head" style="padding:0"><span class="label">AI assistant</span><span class="no">S-301</span></div>
+    <div class="row flip" style="margin-top:28px">
+      <div class="chat" aria-label="Example conversation with the assistant">
+        <div class="bar"><span>Tools ▸ AI Assistant</span><span>bracket.dxf</span></div>
+        <div class="log">
+          <div class="msg you">Draw a 100 by 60 plate with 4 holes of diameter 8, 10 in from the corners, and dimension it.</div>
+          <div class="msg tool"><i>✓</i> load_skill dimension-a-part</div>
+          <div class="msg tool"><i>✓</i> rectang 0,0 100,60 · circle ×4 r=4</div>
+          <div class="msg tool"><i>✓</i> dimlinear ×4 · mleader "4X Ø8"</div>
+          <div class="msg tool"><i>✓</i> render — checked the result</div>
+          <div class="msg">Drew the plate and the four holes on layer Part, and the sizes on a new Dimensions layer. I made the text larger so it reads at this size. Undo once to take it all back.</div>
+          <div class="msg ask">Save the drawing as plate.dxf?
+            <div class="opts"><span>Allow</span><span>Don't Allow</span></div>
+          </div>
+        </div>
+        <div class="input"><span>Ask about this drawing…</span><span>Send ⏎</span></div>
+      </div>
+      <div>
+        <h2>Tell it what you need.<br>It works on your drawing.</h2>
+        <p class="lead">The assistant reads the open drawing, runs the same commands you would, and looks at the result before it answers.</p>
+        <ol class="steps">
+          <li><div><b>Reads the drawing</b><span>Counts, sizes, layers, text and blocks. “How many M8 holes are on this sheet?”</span></div></li>
+          <li><div><b>Draws and edits</b><span>Parts from a description, dimensions, layer clean-up, title blocks, schedules from blocks.</span></div></li>
+          <li><div><b>Asks you</b><span>It can ask a question, or ask you to pick points or objects on the drawing.</span></div></li>
+          <li><div><b>Asks first</b><span>Saving, opening files, exporting, purging, big erases and LISP wait for your Allow.</span></div></li>
+          <li><div><b>One undo</b><span>Each request is a single undo step, so a wrong turn costs one Ctrl+Z.</span></div></li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- S-401 download -->
+<section id="download">
+  <div class="sheet body">
+    <div class="frame-head" style="padding:0"><span class="label">Get CADCraft</span><span class="no">S-401</span></div>
+    <div class="intro">
+      <h2>Download.</h2>
+      <p class="lead" style="margin:0">Free and open source. Version 0.17.0, multiplayer build.</p>
+    </div>
+    <div class="downloads">
+      <div class="dl">
+        <div class="os"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.4 12.6c0-2.4 2-3.5 2-3.6-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.2-2.8.8-3.5.8-.7 0-1.9-.8-3-.8-1.6 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.2.8 1.1 1.7 2.3 2.8 2.3 1.1 0 1.6-.7 3-.7s1.8.7 3 .7c1.2 0 2-1.1 2.8-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.3-.9-2.3-3.6zM14.1 5.6c.6-.8 1-1.8.9-2.9-.9 0-2 .6-2.7 1.4-.6.7-1.1 1.8-1 2.8 1 .1 2.1-.5 2.8-1.3z"/></svg><div><h3>macOS</h3><div class="meta">Apple Silicon · 11 or later</div></div></div>
+        <a class="btn" href="/download/cadcraft-0.17.0-macos-aarch64.dmg">Download .dmg</a>
+        <div class="meta">24 MB</div>
+      </div>
+      <div class="dl">
+        <div class="os"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.1 10 4v7.5H3zM11 3.9 21 2.5v9H11zM3 12.5h7V20l-7-1zM11 12.5h10v9l-10-1.4z"/></svg><div><h3>Windows</h3><div class="meta">64-bit · 10 or 11</div></div></div>
+        <a class="btn" href="/download/cadcraft-0.17.0-windows-x64.msi">Download installer</a>
+        <a class="alt" href="/download/cadcraft-0.17.0-windows-x64-portable.zip">or the portable .zip</a>
+      </div>
+      <div class="dl">
+        <div class="os"><svg viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:var(--ink);stroke-width:1.6"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg><div><h3>Browser</h3><div class="meta">Chrome, Edge, Firefox, Safari</div></div></div>
+        <a class="btn ghost" href="/app">Open CADCraft</a>
+        <a class="alt" href="/app?sample">or open with a sample drawing</a>
+      </div>
+    </div>
+    <div class="notes">
+      <div><b>First launch on Windows:</b> the installer isn't signed yet, so Windows shows “Windows protected your PC”. Choose <span class="mono">More info ▸ Run anyway</span>.</div>
+      <div><b>First launch on macOS:</b> if macOS says it can't check the app, right-click CADCraft in Applications and choose <span class="mono">Open</span>.</div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="sheet">
+    <div class="titleblock">
+      <div><span class="label">Project</span><span class="name">CADCraft Multiplayer</span></div>
+      <div><span class="label">Version</span><span class="val">0.17.0</span></div>
+      <div><span class="label">Licence</span><span class="val">MIT / Apache-2.0</span></div>
+      <div><span class="label">Sheet</span><span class="val">S-001 of 4</span></div>
+      <div class="wide">
+        <span>Built on <a href="https://github.com/storytold/cadcraft">CADCraft</a>, the open-source CAD app by the ArtCraft team.</span>
+        <a href="https://github.com/sriduggi123/cadcraft/tree/multiplayer">Source for this build</a>
+        <span>Not affiliated with Autodesk.</span>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

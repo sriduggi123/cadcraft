@@ -127,6 +127,10 @@ fn radius_and_diameter_follow_circle() {
     assert_eq!(g.value, "⌀6.0000");
     s.execute("move", &json!({ "handles": [c.hex()], "from": [0, 0], "to": [10, 0] })).unwrap();
     assert!(near(dim(&s, r).defpt.xy(), Vec2::new(10.0, 0.0)));
+    let four = h(&s.execute("dimdiameter", &json!({ "handle": c.hex(), "at": [10, 5], "text": "4X <>" })).unwrap());
+    assert_eq!(dim(&s, four).text, "4X <>");
+    let g = cadcraft_render::dimension_in(s.doc().unwrap(), &dim(&s, four));
+    assert_eq!(g.value, "4X ⌀6.0000");
 }
 
 #[test]

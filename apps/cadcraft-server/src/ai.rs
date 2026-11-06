@@ -20,8 +20,13 @@ pub const KEY_VAR: &str = "CADCRAFT_AI_KEY";
 pub const MAX_TOKENS: u64 = 8000;
 /// Most requests to the provider at once, over all users.
 pub const MAX_AT_ONCE: usize = 8;
-/// How long one request may take.
-const WAIT_SECONDS: u32 = 180;
+/// How long one try may take. Replies take 1 to 35 seconds; one that takes longer has usually
+/// stalled at the provider, and a second try answers.
+const WAIT_SECONDS: u32 = 85;
+/// Tries for one request: a stalled one is sent again once (both fit in the app's wait).
+const TRIES: usize = 2;
+/// curl's exit code for "timed out".
+const CURL_TIMED_OUT: i32 = 28;
 /// Most bytes of an answer read back.
 const MAX_REPLY_BYTES: u64 = 4 << 20;
 
@@ -73,11 +78,68 @@ fn header_safe(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect()
 }
 
-/// Ask the model; the reply is the provider's chat completion.
+/// Which reply to the user's latest request this is (1 = the first): the assistant messages
+/// after the last message the user typed, plus one.
+fn reply_number(request: &Value) -> usize {
+    let messages = request.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    // Pictures come as user messages too: a list, or a note in brackets once they are old.
+    let typed = messages.iter().rposition(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|t| !t.starts_with('['))).unwrap_or(0);
+    messages.iter().skip(typed).filter(|m| m["role"] == "assistant").count() + 1
+}
+
+/// Why one try failed: it timed out (worth another try) or something else.
+enum Failed {
+    TimedOut(String),
+    Other(String),
+}
+
+/// Ask the model; the reply is the provider's chat completion. A try that stalls is sent again
+/// once. Failures are logged like answers, so stalls show in the log.
 pub fn ask(cfg: &AiConfig, conversation: &str, request: &Value) -> Result<Value, String> {
     let body = body(cfg, request)?;
     let Some(_slot) = Slot::take() else { return Err("the AI is busy; try again in a moment".into()) };
-    let started = std::time::Instant::now();
+    let who = header_safe(conversation);
+    let mut last = String::new();
+    for attempt in 1..=TRIES {
+        let started = std::time::Instant::now();
+        match try_once(cfg, conversation, &body) {
+            Ok(reply) => {
+                log_answer(&who, request, &reply, started);
+                return Ok(reply);
+            }
+            Err(Failed::TimedOut(why)) => {
+                eprintln!(
+                    "ai: conversation {who}: reply {} try {attempt} timed out after {:.0}s",
+                    reply_number(request),
+                    started.elapsed().as_secs_f64()
+                );
+                last = why;
+            }
+            Err(Failed::Other(why)) => {
+                eprintln!("ai: conversation {who}: reply {} failed after {:.1}s: {why}", reply_number(request), started.elapsed().as_secs_f64());
+                return Err(why);
+            }
+        }
+    }
+    Err(last)
+}
+
+fn log_answer(who: &str, request: &Value, reply: &Value, started: std::time::Instant) {
+    let usage = |p: &str| reply.pointer(&format!("/usage/{p}")).and_then(Value::as_u64).unwrap_or(0);
+    eprintln!(
+        "ai: conversation {who}: reply {} in {:.1}s: {} tokens in ({} cached), {} out ({} reasoning)",
+        reply_number(request),
+        started.elapsed().as_secs_f64(),
+        usage("prompt_tokens"),
+        usage("prompt_tokens_details/cached_tokens"),
+        usage("completion_tokens"),
+        usage("completion_tokens_details/reasoning_tokens"),
+    );
+}
+
+/// One request to the provider with curl.
+fn try_once(cfg: &AiConfig, conversation: &str, body: &Value) -> Result<Value, Failed> {
+    let other = Failed::Other;
     let mut child = Command::new("curl")
         .args(["-sS", "--max-time", &WAIT_SECONDS.to_string(), "-X", "POST", &cfg.endpoint])
         .args(["-H", "Content-Type: application/json"])
@@ -90,31 +152,32 @@ pub fn ask(cfg: &AiConfig, conversation: &str, request: &Value) -> Result<Value,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("can't run curl: {e}"))?;
-    let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+        .map_err(|e| other(format!("can't run curl: {e}")))?;
+    let bytes = serde_json::to_vec(body).map_err(|e| other(e.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&bytes).map_err(|e| format!("can't send the request: {e}"))?;
+        stdin.write_all(&bytes).map_err(|e| other(format!("can't send the request: {e}")))?;
     }
     let mut out = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        stdout.take(MAX_REPLY_BYTES).read_to_end(&mut out).map_err(|e| e.to_string())?;
+        stdout.take(MAX_REPLY_BYTES).read_to_end(&mut out).map_err(|e| other(e.to_string()))?;
     }
     let mut err = String::new();
     if let Some(stderr) = child.stderr.take() {
         let _ = stderr.take(4096).read_to_string(&mut err);
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = child.wait().map_err(|e| other(e.to_string()))?;
+    if status.code() == Some(CURL_TIMED_OUT) {
+        return Err(Failed::TimedOut(format!("the AI did not answer within {WAIT_SECONDS} seconds, twice; try again")));
+    }
     if !status.success() {
-        return Err(format!("the AI could not be reached: {}", err.trim()));
+        return Err(other(format!("the AI could not be reached: {}", err.trim())));
     }
     let text = String::from_utf8_lossy(&out);
     let (reply, code) = text.rsplit_once('\n').unwrap_or((&text, ""));
-    let reply: Value = serde_json::from_str(reply).map_err(|_| format!("the AI answered with HTTP {code} and no readable reply"))?;
+    let reply: Value = serde_json::from_str(reply).map_err(|_| other(format!("the AI answered with HTTP {code} and no readable reply")))?;
     if code.trim() != "200" {
         let why = reply.pointer("/error/message").and_then(Value::as_str).unwrap_or("no reason given");
-        return Err(format!("the AI refused the request (HTTP {}): {}", code.trim(), why.chars().take(300).collect::<String>()));
+        return Err(other(format!("the AI refused the request (HTTP {}): {}", code.trim(), why.chars().take(300).collect::<String>())));
     }
-    let tokens = reply.pointer("/usage/total_tokens").and_then(Value::as_u64).unwrap_or(0);
-    eprintln!("ai: conversation {}: {tokens} tokens in {:.1}s", header_safe(conversation), started.elapsed().as_secs_f64());
     Ok(reply)
 }
